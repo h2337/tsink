@@ -16,6 +16,9 @@ use std::time::Duration;
 use tracing::{error, info};
 
 const WRITABLE_PARTITIONS_NUM: usize = 2;
+#[cfg(test)]
+const CHECK_EXPIRED_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
 const CHECK_EXPIRED_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Timestamp precision for data points.
@@ -142,6 +145,11 @@ impl StorageBuilder {
 
     /// Builds the Storage instance.
     pub fn build(self) -> Result<Arc<dyn Storage>> {
+        let storage = self.build_impl()?;
+        Ok(storage)
+    }
+
+    fn build_impl(self) -> Result<Arc<StorageImpl>> {
         // Check file descriptor limits on Unix systems
         #[cfg(unix)]
         {
@@ -184,7 +192,6 @@ impl StorageBuilder {
             wal: wal.clone(),
             workers_semaphore: Arc::new(Semaphore::new(self.max_writers)),
             closing: Arc::new(AtomicBool::new(false)),
-            memory_partitions: Arc::new(parking_lot::Mutex::new(Vec::new())),
             partition_creation_lock: Arc::new(parking_lot::Mutex::new(())),
         });
 
@@ -203,9 +210,7 @@ impl StorageBuilder {
         storage.new_partition(None)?;
 
         // Start background tasks
-        if self.data_path.is_some() {
-            storage.start_background_tasks();
-        }
+        storage.start_background_tasks();
 
         Ok(storage)
     }
@@ -292,7 +297,6 @@ struct StorageImpl {
     wal: Arc<dyn Wal>,
     workers_semaphore: Arc<Semaphore>,
     closing: Arc<AtomicBool>,
-    memory_partitions: Arc<parking_lot::Mutex<Vec<Arc<MemoryPartition>>>>,
     partition_creation_lock: Arc<parking_lot::Mutex<()>>,
 }
 
@@ -389,9 +393,6 @@ impl StorageImpl {
                 self.timestamp_precision,
                 self.retention,
             ));
-
-            // Store reference to memory partition
-            self.memory_partitions.lock().push(mem_partition.clone());
 
             mem_partition as SharedPartition
         };
@@ -579,7 +580,6 @@ impl StorageImpl {
             wal: self.wal.clone(),
             workers_semaphore: self.workers_semaphore.clone(),
             closing: self.closing.clone(),
-            memory_partitions: self.memory_partitions.clone(),
             partition_creation_lock: self.partition_creation_lock.clone(),
         })
     }
@@ -973,5 +973,45 @@ struct SemaphoreGuard {
 impl Drop for SemaphoreGuard {
     fn drop(&mut self) {
         let _ = self.returns.send(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn memory_mode_removes_expired_partitions_in_background() {
+        let storage = StorageBuilder::new()
+            .with_retention(Duration::from_millis(50))
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_partition_duration(Duration::from_millis(10))
+            .build_impl()
+            .unwrap();
+
+        let row = Row::new("metric", DataPoint::new(1, 1.0));
+        storage.insert_rows(&[row]).unwrap();
+
+        let partition_with_data = storage
+            .partition_list
+            .iter()
+            .find(|partition| partition.size() > 0)
+            .expect("expected partition with data");
+        let weak_partition = Arc::downgrade(&partition_with_data);
+        drop(partition_with_data);
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while weak_partition.upgrade().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            weak_partition.upgrade().is_none(),
+            "expired memory partition should be dropped"
+        );
+
+        storage.close().unwrap();
     }
 }

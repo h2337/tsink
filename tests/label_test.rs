@@ -83,8 +83,7 @@ fn test_select_all_with_multiple_labels() {
                     .iter()
                     .any(|l| l.name == "region" && l.value == "us-west")
             );
-        }
-        else if labels
+        } else if labels
             .iter()
             .any(|l| l.name == "host" && l.value == "server2")
         {
@@ -95,8 +94,7 @@ fn test_select_all_with_multiple_labels() {
                     .iter()
                     .any(|l| l.name == "region" && l.value == "us-east")
             );
-        }
-        else if labels
+        } else if labels
             .iter()
             .any(|l| l.name == "host" && l.value == "server3")
         {

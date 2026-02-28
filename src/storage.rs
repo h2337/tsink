@@ -121,7 +121,6 @@ impl StorageBuilder {
         Self::default()
     }
 
-
     /// Sets the data path for persistent storage.
     pub fn with_data_path(mut self, path: impl AsRef<Path>) -> Self {
         self.data_path = Some(path.as_ref().to_path_buf());
@@ -305,7 +304,13 @@ pub enum Aggregation {
     Min,
     Max,
     Avg,
+    First,
     Last,
+    Count,
+    Median,
+    Range,
+    Variance,
+    StdDev,
 }
 
 /// Downsampling configuration.
@@ -708,10 +713,8 @@ impl StorageImpl {
             created += 1;
         }
 
-        if created > 0 {
-            if self.data_path.is_some() {
-                self.schedule_flush_partitions();
-            }
+        if created > 0 && self.data_path.is_some() {
+            self.schedule_flush_partitions();
         }
 
         Ok(())
@@ -877,9 +880,7 @@ impl StorageImpl {
                     crate::disk::DiskPartition::create(&dir_path, meta, data, self.retention)?;
                 Ok(Some(Arc::new(disk_partition) as SharedPartition))
             }
-            None => {
-                Ok(None)
-            }
+            None => Ok(None),
         }
     }
 
@@ -1293,6 +1294,58 @@ fn sum_and_count_non_nan(points: &[DataPoint]) -> Option<(f64, usize)> {
     if count == 0 { None } else { Some((sum, count)) }
 }
 
+fn median_non_nan(points: &[DataPoint]) -> Option<f64> {
+    let mut values: Vec<f64> = points
+        .iter()
+        .filter_map(|point| {
+            if point.value.is_nan() {
+                None
+            } else {
+                Some(point.value)
+            }
+        })
+        .collect();
+
+    if values.is_empty() {
+        return None;
+    }
+
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+
+    if values.len() % 2 == 1 {
+        Some(values[mid])
+    } else {
+        Some((values[mid - 1] + values[mid]) / 2.0)
+    }
+}
+
+fn range_non_nan(points: &[DataPoint]) -> Option<f64> {
+    let min = min_non_nan_point(points)?.value;
+    let max = max_non_nan_point(points)?.value;
+    Some(max - min)
+}
+
+fn population_variance_non_nan(points: &[DataPoint]) -> Option<f64> {
+    let mut count = 0.0f64;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+
+    for point in points {
+        if point.value.is_nan() {
+            continue;
+        }
+
+        count += 1.0;
+        let delta = point.value - mean;
+        mean += delta / count;
+        let delta2 = point.value - mean;
+        m2 += delta * delta2;
+    }
+
+    if count == 0.0 { None } else { Some(m2 / count) }
+}
+
 fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Option<DataPoint> {
     if points.is_empty() {
         return None;
@@ -1300,7 +1353,12 @@ fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Option<Da
 
     match aggregation {
         Aggregation::None => None,
+        Aggregation::First => points.first().copied(),
         Aggregation::Last => points.last().copied(),
+        Aggregation::Count => Some(DataPoint::new(
+            points.last().unwrap().timestamp,
+            points.iter().filter(|point| !point.value.is_nan()).count() as f64,
+        )),
         Aggregation::Sum | Aggregation::Avg => sum_and_count_non_nan(points)
             .map(|(sum, count)| {
                 let value = if aggregation == Aggregation::Avg {
@@ -1313,6 +1371,18 @@ fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Option<Da
             .or_else(|| points.last().copied()),
         Aggregation::Min => min_non_nan_point(points).or_else(|| points.last().copied()),
         Aggregation::Max => max_non_nan_point(points).or_else(|| points.last().copied()),
+        Aggregation::Median => median_non_nan(points)
+            .map(|value| DataPoint::new(points.last().unwrap().timestamp, value))
+            .or_else(|| points.last().copied()),
+        Aggregation::Range => range_non_nan(points)
+            .map(|value| DataPoint::new(points.last().unwrap().timestamp, value))
+            .or_else(|| points.last().copied()),
+        Aggregation::Variance => population_variance_non_nan(points)
+            .map(|value| DataPoint::new(points.last().unwrap().timestamp, value))
+            .or_else(|| points.last().copied()),
+        Aggregation::StdDev => population_variance_non_nan(points)
+            .map(|value| DataPoint::new(points.last().unwrap().timestamp, value.sqrt()))
+            .or_else(|| points.last().copied()),
     }
 }
 
@@ -1327,7 +1397,12 @@ fn aggregate_bucket(
 
     match aggregation {
         Aggregation::None => None,
+        Aggregation::First => points.first().copied(),
         Aggregation::Last => points.last().copied(),
+        Aggregation::Count => Some(DataPoint::new(
+            bucket_start,
+            points.iter().filter(|point| !point.value.is_nan()).count() as f64,
+        )),
         Aggregation::Sum | Aggregation::Avg => sum_and_count_non_nan(points)
             .map(|(sum, count)| {
                 let value = if aggregation == Aggregation::Avg {
@@ -1343,6 +1418,18 @@ fn aggregate_bucket(
             .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
         Aggregation::Max => max_non_nan_point(points)
             .map(|p| DataPoint::new(bucket_start, p.value))
+            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
+        Aggregation::Median => median_non_nan(points)
+            .map(|value| DataPoint::new(bucket_start, value))
+            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
+        Aggregation::Range => range_non_nan(points)
+            .map(|value| DataPoint::new(bucket_start, value))
+            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
+        Aggregation::Variance => population_variance_non_nan(points)
+            .map(|value| DataPoint::new(bucket_start, value))
+            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
+        Aggregation::StdDev => population_variance_non_nan(points)
+            .map(|value| DataPoint::new(bucket_start, value.sqrt()))
             .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
     }
 }

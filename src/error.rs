@@ -135,9 +135,9 @@ impl From<crossbeam_channel::RecvError> for TsinkError {
 impl From<crossbeam_channel::RecvTimeoutError> for TsinkError {
     fn from(e: crossbeam_channel::RecvTimeoutError) -> Self {
         match e {
-            crossbeam_channel::RecvTimeoutError::Timeout => TsinkError::ChannelTimeout {
-                timeout_ms: 0,
-            },
+            crossbeam_channel::RecvTimeoutError::Timeout => {
+                TsinkError::ChannelTimeout { timeout_ms: 0 }
+            }
             crossbeam_channel::RecvTimeoutError::Disconnected => TsinkError::ChannelReceive {
                 channel: "timeout: channel disconnected".to_string(),
             },

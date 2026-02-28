@@ -148,6 +148,8 @@ for series in all_series_with_wal {
 
 Use `select_with_options` to shape query results without post-processing:
 
+Available aggregations: `None`, `Sum`, `Min`, `Max`, `Avg`, `First`, `Last`, `Count`, `Median`, `Range`, `Variance`, `StdDev`.
+
 ```rust
 use tsink::{
     Aggregation, DataPoint, Label, QueryOptions, Row,

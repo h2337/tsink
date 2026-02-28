@@ -384,12 +384,12 @@ impl crate::partition::Partition for MemoryPartition {
         for entry in self.metrics.iter() {
             let (marshaled_name, metric_ref) = entry.pair();
 
-            if let Ok((base_metric, labels)) = unmarshal_metric_name(marshaled_name) {
-                if base_metric == metric {
-                    let points = metric_ref.select_points(start, end);
-                    if !points.is_empty() {
-                        results.push((labels, points));
-                    }
+            if let Ok((base_metric, labels)) = unmarshal_metric_name(marshaled_name)
+                && base_metric == metric
+            {
+                let points = metric_ref.select_points(start, end);
+                if !points.is_empty() {
+                    results.push((labels, points));
                 }
             }
         }
@@ -700,14 +700,10 @@ pub fn flush_memory_partition_to_disk(
     let flush_result = partition.flush_to_disk()?;
 
     match flush_result {
-        Some((data, meta)) => {
-            DiskPartition::create(dir_path, meta, data, retention)
-        }
-        None => {
-            Err(TsinkError::Other(
-                "Partition does not support flushing to disk".to_string(),
-            ))
-        }
+        Some((data, meta)) => DiskPartition::create(dir_path, meta, data, retention),
+        None => Err(TsinkError::Other(
+            "Partition does not support flushing to disk".to_string(),
+        )),
     }
 }
 

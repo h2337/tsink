@@ -51,6 +51,10 @@ default = []
 name = "storage_benchmarks"
 harness = false
 
+[[bench]]
+name = "workload"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

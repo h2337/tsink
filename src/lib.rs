@@ -5,16 +5,12 @@
 pub mod bstream;
 pub mod cgroup;
 pub mod concurrency;
-pub mod disk;
 pub mod encoding;
+pub mod engine;
 pub mod error;
 pub mod label;
-pub mod list;
-pub mod memory;
 pub mod mmap;
-pub mod partition;
 pub mod storage;
-pub(crate) mod time;
 pub mod value;
 pub mod wal;
 

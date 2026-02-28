@@ -23,13 +23,11 @@ fn example_with_data_path() -> tsink::Result<()> {
     Ok(())
 }
 
-/// Example: Custom partition duration
-fn example_with_partition_duration() -> tsink::Result<()> {
-    println!("\n=== Example: Custom Partition Duration ===");
+/// Example: Custom chunk point target
+fn example_with_chunk_points() -> tsink::Result<()> {
+    println!("\n=== Example: Custom Chunk Point Target ===");
 
-    let storage = StorageBuilder::new()
-        .with_partition_duration(Duration::from_secs(3600 * 5)) // 5 hours
-        .build()?;
+    let storage = StorageBuilder::new().with_chunk_points(512).build()?;
 
     for i in 0..10 {
         let timestamp = 1600000000 + (i * 3600 * 2); // 2 hour intervals
@@ -38,7 +36,7 @@ fn example_with_partition_duration() -> tsink::Result<()> {
     }
 
     storage.close()?;
-    println!("Created partitions with 5-hour duration");
+    println!("Created chunks with target 512 points each");
     Ok(())
 }
 
@@ -298,7 +296,7 @@ fn main() -> tsink::Result<()> {
     println!("============================");
 
     example_with_data_path()?;
-    example_with_partition_duration()?;
+    example_with_chunk_points()?;
     example_insert_and_select()?;
     example_concurrent_operations()?;
     example_out_of_order_insertion()?;

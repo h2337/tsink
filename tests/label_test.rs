@@ -153,7 +153,7 @@ fn test_select_all_mixed_labels_and_no_labels() {
 
     let rows2 = vec![Row::with_labels(
         "requests",
-        vec![Label::new("endpoint", "/api/v1")],
+        vec![Label::new("endpoint", "/api/core")],
         DataPoint::new(1500, 150.0),
     )];
     storage.insert_rows(&rows2).unwrap();
@@ -177,7 +177,7 @@ fn test_select_all_mixed_labels_and_no_labels() {
             found_labeled = true;
             assert_eq!(points.len(), 1);
             assert_eq!(labels[0].name, "endpoint");
-            assert_eq!(labels[0].value, "/api/v1");
+            assert_eq!(labels[0].value, "/api/core");
         }
     }
 

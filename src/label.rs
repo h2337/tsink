@@ -10,7 +10,7 @@ pub const MAX_LABEL_NAME_LEN: usize = 256;
 /// Maximum length of label value.
 pub const MAX_LABEL_VALUE_LEN: usize = 16 * 1024;
 
-/// Maximum metric-name length that can be marshaled losslessly by the v1 format.
+/// Maximum metric-name length that can be marshaled losslessly by the current binary format.
 pub const MAX_METRIC_NAME_LEN: usize = u16::MAX as usize;
 
 /// A time-series label.

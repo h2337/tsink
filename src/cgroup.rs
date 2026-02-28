@@ -40,13 +40,13 @@ fn parse_cpu_override_env(var_name: &str) -> Option<usize> {
     (parsed > 0).then_some(parsed)
 }
 
-/// Gets CPU quota from cgroup v2.
+/// Gets CPU quota from cgroup unified hierarchy.
 fn get_cpu_quota() -> Option<f64> {
-    get_cpu_quota_v2()
+    get_cpu_quota_unified()
 }
 
-/// Gets CPU quota from cgroup v2
-fn get_cpu_quota_v2() -> Option<f64> {
+/// Gets CPU quota from cgroup unified hierarchy
+fn get_cpu_quota_unified() -> Option<f64> {
     let cpu_max_path = "/sys/fs/cgroup/cpu.max";
     if !Path::new(cpu_max_path).exists() {
         return None;
@@ -70,11 +70,11 @@ fn get_cpu_quota_v2() -> Option<f64> {
 
 /// Returns the memory limit in bytes from cgroup settings
 pub fn get_memory_limit() -> Option<i64> {
-    get_memory_limit_v2()
+    get_memory_limit_unified()
 }
 
-/// Gets memory limit from cgroup v2
-fn get_memory_limit_v2() -> Option<i64> {
+/// Gets memory limit from cgroup unified hierarchy
+fn get_memory_limit_unified() -> Option<i64> {
     let mem_max_path = "/sys/fs/cgroup/memory.max";
     if !Path::new(mem_max_path).exists() {
         return None;

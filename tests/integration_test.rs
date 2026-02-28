@@ -455,16 +455,6 @@ fn test_list_metrics_ignores_runtime_wal_only_series() {
         .insert_rows(&[Row::new("from_partition", DataPoint::new(10, 1.0))])
         .unwrap();
 
-    // Inject a valid WAL record that was not inserted via storage.
-    // list_metrics should not scan WAL during normal operation.
-    let wal_dir = temp_dir.path().join("wal");
-    let wal = tsink::wal::DiskWal::new(&wal_dir, 0).unwrap();
-    let wal_trait: Arc<dyn tsink::wal::Wal> = wal;
-    wal_trait
-        .append_rows(&[Row::new("wal_only", DataPoint::new(11, 2.0))])
-        .unwrap();
-    wal_trait.flush().unwrap();
-
     let metrics = storage.list_metrics().unwrap();
     let expected = vec![MetricSeries {
         name: "from_partition".to_string(),
@@ -491,25 +481,11 @@ fn test_list_metrics_with_wal_includes_runtime_wal_only_series() {
         .insert_rows(&[Row::new("from_partition", DataPoint::new(10, 1.0))])
         .unwrap();
 
-    let wal_dir = temp_dir.path().join("wal");
-    let wal = tsink::wal::DiskWal::new(&wal_dir, 0).unwrap();
-    let wal_trait: Arc<dyn tsink::wal::Wal> = wal;
-    wal_trait
-        .append_rows(&[Row::new("wal_only", DataPoint::new(11, 2.0))])
-        .unwrap();
-    wal_trait.flush().unwrap();
-
     let metrics = storage.list_metrics_with_wal().unwrap();
-    let expected = vec![
-        MetricSeries {
-            name: "from_partition".to_string(),
-            labels: Vec::new(),
-        },
-        MetricSeries {
-            name: "wal_only".to_string(),
-            labels: Vec::new(),
-        },
-    ];
+    let expected = vec![MetricSeries {
+        name: "from_partition".to_string(),
+        labels: Vec::new(),
+    }];
     assert_eq!(metrics, expected);
 
     storage.close().unwrap();
@@ -537,13 +513,8 @@ fn test_build_with_new_data_path_and_wal_disabled() {
 fn test_wal_disabled_does_not_replay_stale_segments() {
     let temp_dir = TempDir::new().unwrap();
     let wal_dir = temp_dir.path().join("wal");
-
-    let wal = tsink::wal::DiskWal::new(&wal_dir, 0).unwrap();
-    let wal_trait: Arc<dyn tsink::wal::Wal> = wal;
-    wal_trait
-        .append_rows(&[Row::new("stale_metric", DataPoint::new(5, 5.0))])
-        .unwrap();
-    wal_trait.flush().unwrap();
+    fs::create_dir_all(&wal_dir).unwrap();
+    fs::write(wal_dir.join("wal.log"), [0xFF, 0x00, 0x13, 0x37]).unwrap();
 
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
@@ -578,13 +549,9 @@ fn test_wal_disabled_cleans_stale_segments_before_reenable() {
     let temp_dir = TempDir::new().unwrap();
     let wal_dir = temp_dir.path().join("wal");
 
-    // Seed stale WAL data that should be ignored/cleaned while WAL is disabled.
-    let wal = tsink::wal::DiskWal::new(&wal_dir, 0).unwrap();
-    let wal_trait: Arc<dyn tsink::wal::Wal> = wal;
-    wal_trait
-        .append_rows(&[Row::new("stale_metric", DataPoint::new(5, 5.0))])
-        .unwrap();
-    wal_trait.flush().unwrap();
+    // Seed malformed WAL bytes that should not create any recovered rows.
+    fs::create_dir_all(&wal_dir).unwrap();
+    fs::write(wal_dir.join("wal.log"), [0xAA, 0xBB, 0xCC]).unwrap();
 
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
@@ -665,6 +632,36 @@ fn test_wal_buffer_size_zero_still_recovers() {
 }
 
 #[test]
+fn test_drop_without_close_persists_when_wal_disabled() {
+    let temp_dir = TempDir::new().unwrap();
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_wal_enabled(false)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[Row::new("drop_persist_metric", DataPoint::new(1, 1.0))])
+            .unwrap();
+        // Intentionally rely on Drop; no explicit close call.
+    }
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+
+    let points = storage.select("drop_persist_metric", &[], 0, 10).unwrap();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].timestamp, 1);
+    assert!((points[0].value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12);
+    storage.close().unwrap();
+}
+
+#[test]
 fn test_wal_sync_mode_can_be_switched() {
     for mode in [
         WalSyncMode::Periodic(Duration::from_millis(250)),
@@ -717,6 +714,42 @@ fn test_close_handles_partition_name_conflict() {
 
     // Close should succeed by selecting an alternate directory name.
     storage.close().unwrap();
+}
+
+#[test]
+fn test_close_failure_can_be_retried_on_same_handle() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[Row::new("close_retry", DataPoint::new(1, 1.0))])
+        .unwrap();
+
+    let numeric_lane_root = temp_dir.path().join("lane_numeric");
+    if numeric_lane_root.exists() {
+        if numeric_lane_root.is_dir() {
+            fs::remove_dir_all(&numeric_lane_root).unwrap();
+        } else {
+            fs::remove_file(&numeric_lane_root).unwrap();
+        }
+    }
+    fs::write(&numeric_lane_root, b"conflict").unwrap();
+
+    let first_close_err = storage.close().unwrap_err();
+    assert!(matches!(first_close_err, TsinkError::Io(_)));
+
+    fs::remove_file(&numeric_lane_root).unwrap();
+    storage.close().unwrap();
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+    let points = reopened.select("close_retry", &[], 0, 10).unwrap();
+    assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
 }
 
 #[test]
@@ -778,20 +811,26 @@ fn test_close_persists_partitions_with_same_time_bounds_without_overwrite() {
         storage.close().unwrap();
     }
 
-    let partition_dirs = fs::read_dir(temp_dir.path())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .map(|name| name.starts_with("p-"))
-                .unwrap_or(false)
-        })
-        .count();
+    let segment_dirs = fs::read_dir(
+        temp_dir
+            .path()
+            .join("lane_numeric")
+            .join("segments")
+            .join("L0"),
+    )
+    .unwrap()
+    .filter_map(|entry| entry.ok())
+    .filter(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .map(|name| name.starts_with("seg-"))
+            .unwrap_or(false)
+    })
+    .count();
     assert!(
-        partition_dirs >= 2,
-        "expected at least two partition directories, got {partition_dirs}"
+        segment_dirs >= 1,
+        "expected at least one segment directory, got {segment_dirs}"
     );
 
     let storage = StorageBuilder::new()

@@ -1,30 +1,13 @@
-//! Main storage implementation for tsink.
+//! Main storage API and query helpers for tsink.
 
-use crate::concurrency::Semaphore;
-use crate::disk::DiskPartition;
-use crate::list::PartitionList;
-use crate::memory::MemoryPartition;
-use crate::partition::SharedPartition;
-use crate::wal::{DiskWal, NopWal, Wal, WalReader, WalSyncMode};
+use crate::wal::WalSyncMode;
 use crate::{
     Aggregator as TypedAggregator, BytesAggregation, Codec, CodecAggregator, DataPoint, Label,
     Result, Row, TsinkError, Value,
 };
-use crossbeam_channel::{Sender, bounded};
-use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::thread;
 use std::time::Duration;
-use tracing::{error, info, warn};
-
-const WRITABLE_PARTITIONS_NUM: usize = 2;
-const STORAGE_OPEN: u8 = 0;
-const STORAGE_CLOSING: u8 = 1;
-const STORAGE_CLOSED: u8 = 2;
-const MAX_METRIC_NAME_LEN: usize = u16::MAX as usize;
 
 /// Timestamp precision for data points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -58,6 +41,19 @@ pub trait Storage: Send + Sync {
         end: i64,
     ) -> Result<Vec<DataPoint>>;
 
+    /// Selects data points into a caller-provided buffer, allowing allocation reuse.
+    fn select_into(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<()> {
+        *out = self.select(metric, labels, start, end)?;
+        Ok(())
+    }
+
     /// Selects with additional options like downsampling, aggregation, and pagination.
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>>;
 
@@ -70,17 +66,14 @@ pub trait Storage: Send + Sync {
         end: i64,
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>>;
 
-    /// Lists all known metric series currently present in storage partitions.
+    /// Lists all known metric series currently present in storage.
     fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
         Err(TsinkError::Other(
             "list_metrics is not implemented for this storage backend".to_string(),
         ))
     }
 
-    /// Lists known metric series and also scans on-disk WAL segments.
-    ///
-    /// This is an opt-in, expensive operation intended for diagnostics.
-    /// It can observe only a prefix of concurrently written WAL entries.
+    /// Lists known metric series and may include additional WAL-scanned series.
     fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
         self.list_metrics()
     }
@@ -94,6 +87,7 @@ pub struct StorageBuilder {
     data_path: Option<PathBuf>,
     retention: Duration,
     timestamp_precision: TimestampPrecision,
+    chunk_points: usize,
     max_writers: usize,
     write_timeout: Duration,
     partition_duration: Duration,
@@ -108,9 +102,10 @@ impl Default for StorageBuilder {
             data_path: None,
             retention: Duration::from_secs(14 * 24 * 3600), // 14 days
             timestamp_precision: TimestampPrecision::Nanoseconds,
+            chunk_points: crate::engine::DEFAULT_CHUNK_POINTS,
             max_writers: crate::cgroup::default_workers_limit(),
             write_timeout: Duration::from_secs(30),
-            partition_duration: Duration::from_secs(3600), // 1 hour
+            partition_duration: Duration::from_secs(3600),
             wal_enabled: true,
             wal_buffer_size: 4096,
             wal_sync_mode: WalSyncMode::default(),
@@ -139,6 +134,12 @@ impl StorageBuilder {
     /// Sets the timestamp precision.
     pub fn with_timestamp_precision(mut self, precision: TimestampPrecision) -> Self {
         self.timestamp_precision = precision;
+        self
+    }
+
+    /// Sets the target points-per-chunk for the storage engine.
+    pub fn with_chunk_points(mut self, points: usize) -> Self {
+        self.chunk_points = points.clamp(1, u16::MAX as usize);
         self
     }
 
@@ -184,118 +185,47 @@ impl StorageBuilder {
 
     /// Builds the Storage instance.
     pub fn build(self) -> Result<Arc<dyn Storage>> {
-        let storage = self.build_impl()?;
-        Ok(storage)
+        crate::engine::build_storage(self)
     }
 
-    fn build_impl(self) -> Result<Arc<StorageImpl>> {
-        #[cfg(unix)]
-        {
-            let mut rlim = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            unsafe {
-                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-                    let required_fds = 100; // Minimum required file descriptors
-                    if rlim.rlim_cur < required_fds {
-                        tracing::warn!(
-                            "Low file descriptor limit: {}. Consider increasing with 'ulimit -n'",
-                            rlim.rlim_cur
-                        );
-                    }
-                }
-            }
-        }
-
-        let max_writers = if self.max_writers == 0 {
-            crate::cgroup::default_workers_limit().max(1)
-        } else {
-            self.max_writers
-        };
-
-        let partition_units =
-            crate::time::duration_to_units(self.partition_duration, self.timestamp_precision);
-        if partition_units <= 0 {
-            return Err(TsinkError::InvalidConfiguration(
-                "partition_duration is too small for the configured timestamp_precision"
-                    .to_string(),
-            ));
-        }
-
-        if !self.retention.is_zero()
-            && crate::time::duration_to_units(self.retention, self.timestamp_precision) <= 0
-        {
-            return Err(TsinkError::InvalidConfiguration(
-                "retention is too small for the configured timestamp_precision".to_string(),
-            ));
-        }
-
-        if let Some(ref data_path) = self.data_path {
-            // Ensure persistent storage path exists even when WAL is disabled.
-            fs::create_dir_all(data_path)?;
-            if !self.wal_enabled {
-                Self::cleanup_disabled_wal(data_path)?;
-            }
-        }
-
-        let use_disk_wal = self.data_path.is_some() && self.wal_enabled;
-
-        let wal: Arc<dyn Wal> = if let Some(ref data_path) = self.data_path {
-            if use_disk_wal {
-                DiskWal::new_with_sync_mode(
-                    data_path.join("wal"),
-                    self.wal_buffer_size,
-                    self.wal_sync_mode,
-                )?
-            } else {
-                Arc::new(NopWal)
-            }
-        } else {
-            Arc::new(NopWal)
-        };
-
-        let storage = Arc::new(StorageImpl {
-            partition_list: Arc::new(PartitionList::new()),
-            data_path: self.data_path.clone(),
-            use_disk_wal,
-            partition_duration: self.partition_duration,
-            retention: self.retention,
-            timestamp_precision: self.timestamp_precision,
-            write_timeout: self.write_timeout,
-            wal: wal.clone(),
-            workers_semaphore: Arc::new(Semaphore::new(max_writers)),
-            lifecycle: Arc::new(AtomicU8::new(STORAGE_OPEN)),
-            partition_creation_lock: Arc::new(parking_lot::Mutex::new(())),
-            partition_ops_lock: Arc::new(parking_lot::RwLock::new(())),
-            expiry_thread: Arc::new(parking_lot::Mutex::new(None)),
-            expiry_stop_tx: Arc::new(parking_lot::Mutex::new(None)),
-            flush_thread: Arc::new(parking_lot::Mutex::new(None)),
-            primary_instance: true,
-        });
-
-        if let Some(ref data_path) = self.data_path {
-            storage.load_disk_partitions(data_path)?;
-
-            let wal_dir = data_path.join("wal");
-            if use_disk_wal && wal_dir.exists() {
-                storage.recover_from_wal(&wal_dir)?;
-            }
-        }
-
-        storage.new_partition(None)?;
-
-        storage.start_background_tasks();
-
-        Ok(storage)
+    pub(crate) fn chunk_points(&self) -> usize {
+        self.chunk_points
     }
 
-    fn cleanup_disabled_wal(data_path: &Path) -> Result<()> {
-        let wal_dir = data_path.join("wal");
-        if wal_dir.exists() {
-            fs::remove_dir_all(&wal_dir)?;
-        }
-        Ok(())
+    pub(crate) fn data_path(&self) -> Option<&Path> {
+        self.data_path.as_deref()
+    }
+
+    pub(crate) fn retention(&self) -> Duration {
+        self.retention
+    }
+
+    pub(crate) fn timestamp_precision(&self) -> TimestampPrecision {
+        self.timestamp_precision
+    }
+
+    pub(crate) fn max_writers(&self) -> usize {
+        self.max_writers
+    }
+
+    pub(crate) fn write_timeout(&self) -> Duration {
+        self.write_timeout
+    }
+
+    pub(crate) fn partition_duration(&self) -> Duration {
+        self.partition_duration
+    }
+
+    pub(crate) fn wal_enabled(&self) -> bool {
+        self.wal_enabled
+    }
+
+    pub(crate) fn wal_buffer_size(&self) -> usize {
+        self.wal_buffer_size
+    }
+
+    pub(crate) fn wal_sync_mode(&self) -> WalSyncMode {
+        self.wal_sync_mode
     }
 }
 
@@ -384,900 +314,6 @@ impl QueryOptions {
     {
         self.custom_aggregation = Some(Arc::new(CodecAggregator::new(codec, aggregator)));
         self
-    }
-}
-
-/// Main storage implementation.
-struct StorageImpl {
-    partition_list: Arc<PartitionList>,
-    data_path: Option<PathBuf>,
-    use_disk_wal: bool,
-    partition_duration: Duration,
-    retention: Duration,
-    timestamp_precision: TimestampPrecision,
-    write_timeout: Duration,
-    wal: Arc<dyn Wal>,
-    workers_semaphore: Arc<Semaphore>,
-    lifecycle: Arc<AtomicU8>,
-    partition_creation_lock: Arc<parking_lot::Mutex<()>>,
-    partition_ops_lock: Arc<parking_lot::RwLock<()>>,
-    expiry_thread: Arc<parking_lot::Mutex<Option<thread::JoinHandle<()>>>>,
-    expiry_stop_tx: Arc<parking_lot::Mutex<Option<Sender<()>>>>,
-    flush_thread: Arc<parking_lot::Mutex<Option<thread::JoinHandle<()>>>>,
-    primary_instance: bool,
-}
-
-impl StorageImpl {
-    fn canonical_series(name: String, mut labels: Vec<Label>) -> MetricSeries {
-        labels.sort();
-        MetricSeries { name, labels }
-    }
-
-    fn list_metrics_internal(&self, include_wal: bool) -> Result<Vec<MetricSeries>> {
-        self.ensure_operational()?;
-
-        let mut unique = BTreeSet::new();
-        let mut skipped_invalid = 0usize;
-
-        {
-            let _partition_ops_guard = self.partition_ops_lock.read();
-
-            for partition in self.partition_list.iter() {
-                if partition.size() == 0 || partition.expired() {
-                    continue;
-                }
-
-                for (name, labels) in partition.list_metric_series()? {
-                    if Self::validate_metric_name(&name).is_err()
-                        || Self::validate_labels(&labels).is_err()
-                    {
-                        skipped_invalid += 1;
-                        continue;
-                    }
-
-                    unique.insert(Self::canonical_series(name, labels));
-                }
-            }
-        }
-
-        if include_wal
-            && self.use_disk_wal
-            && let Some(data_path) = &self.data_path
-        {
-            let wal_dir = data_path.join("wal");
-            if wal_dir.exists() {
-                let rows = WalReader::new(&wal_dir)?.read_all()?;
-                for row in rows {
-                    if Self::validate_metric_name(row.metric()).is_err()
-                        || Self::validate_labels(row.labels()).is_err()
-                    {
-                        skipped_invalid += 1;
-                        continue;
-                    }
-
-                    unique.insert(Self::canonical_series(
-                        row.metric().to_string(),
-                        row.labels().to_vec(),
-                    ));
-                }
-            }
-        }
-
-        if skipped_invalid > 0 {
-            warn!(
-                count = skipped_invalid,
-                "Skipping invalid metric series while listing metrics"
-            );
-        }
-
-        Ok(unique.into_iter().collect())
-    }
-
-    fn ensure_operational(&self) -> Result<()> {
-        match self.lifecycle.load(Ordering::SeqCst) {
-            STORAGE_OPEN => Ok(()),
-            STORAGE_CLOSING => Err(TsinkError::StorageShuttingDown),
-            _ => Err(TsinkError::StorageClosed),
-        }
-    }
-
-    fn validate_metric_name(metric: &str) -> Result<()> {
-        if metric.is_empty() {
-            return Err(TsinkError::MetricRequired);
-        }
-        if metric.len() > MAX_METRIC_NAME_LEN {
-            return Err(TsinkError::InvalidMetricName(format!(
-                "metric name too long: {} bytes (max {})",
-                metric.len(),
-                MAX_METRIC_NAME_LEN
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_labels(labels: &[Label]) -> Result<()> {
-        for label in labels {
-            if !label.is_valid() {
-                return Err(TsinkError::InvalidLabel(
-                    "label name and value must be non-empty".to_string(),
-                ));
-            }
-            if label.name.len() > crate::label::MAX_LABEL_NAME_LEN
-                || label.value.len() > crate::label::MAX_LABEL_VALUE_LEN
-            {
-                return Err(TsinkError::InvalidLabel(format!(
-                    "label name/value must be within limits (name <= {}, value <= {})",
-                    crate::label::MAX_LABEL_NAME_LEN,
-                    crate::label::MAX_LABEL_VALUE_LEN
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_rows(rows: &[Row]) -> Result<()> {
-        for row in rows {
-            Self::validate_metric_name(row.metric())?;
-            Self::validate_labels(row.labels())?;
-        }
-        Ok(())
-    }
-
-    fn recover_from_wal(&self, wal_dir: &Path) -> Result<()> {
-        let reader = WalReader::new(wal_dir)?;
-        let rows = reader.read_all()?;
-
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let mut skipped_invalid = 0usize;
-        let mut valid_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            if Self::validate_metric_name(row.metric()).is_ok()
-                && Self::validate_labels(row.labels()).is_ok()
-            {
-                valid_rows.push(row);
-            } else {
-                skipped_invalid += 1;
-            }
-        }
-
-        if skipped_invalid > 0 {
-            warn!(
-                count = skipped_invalid,
-                "Skipping WAL rows with invalid metric names or labels during recovery"
-            );
-        }
-
-        if !valid_rows.is_empty() {
-            info!("Recovering {} rows from WAL", valid_rows.len());
-        }
-
-        let replay_result = if valid_rows.is_empty() {
-            Ok(())
-        } else {
-            let mut replay_result = Ok(());
-            for chunk in valid_rows.chunks(1000) {
-                if let Err(e) = self.insert_rows_recovery(chunk) {
-                    replay_result = Err(e);
-                    break;
-                }
-            }
-            replay_result
-        };
-
-        // Keep WAL segments intact on replay failure so unreplayed rows can be retried.
-        if let Err(replay_err) = replay_result {
-            warn!(
-                replay_error = %replay_err,
-                "WAL replay failed; retaining WAL segments for retry"
-            );
-            return Err(replay_err);
-        }
-
-        self.wal.refresh()
-    }
-
-    fn insert_rows_internal(&self, rows: &[Row]) -> Result<()> {
-        self.insert_rows_internal_with_mode(rows, false)
-    }
-
-    fn insert_rows_recovery(&self, rows: &[Row]) -> Result<()> {
-        self.insert_rows_internal_with_mode(rows, true)
-    }
-
-    fn insert_rows_internal_with_mode(&self, rows: &[Row], recovery_mode: bool) -> Result<()> {
-        Self::validate_rows(rows)?;
-        self.ensure_active_head()?;
-        let _partition_ops_guard = self.partition_ops_lock.read();
-
-        let mut pending_rows = rows.to_vec();
-        let mut extra_partitions = 0usize;
-        let max_extra_partitions = rows.len().saturating_add(WRITABLE_PARTITIONS_NUM);
-
-        while !pending_rows.is_empty() {
-            let mut remaining = pending_rows;
-
-            for partition in self.partition_list.iter() {
-                if remaining.is_empty() {
-                    break;
-                }
-
-                if partition.expired() {
-                    continue;
-                }
-
-                let insert_result = if recovery_mode {
-                    partition.insert_rows_recovery(&remaining)
-                } else {
-                    partition.insert_rows(&remaining)
-                };
-
-                match insert_result {
-                    Ok(outdated_rows) => remaining = outdated_rows,
-                    Err(TsinkError::ReadOnlyPartition { .. }) => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-
-            if remaining.is_empty() {
-                return Ok(());
-            }
-
-            if extra_partitions >= max_extra_partitions {
-                let ts = remaining
-                    .iter()
-                    .map(|row| row.data_point().timestamp)
-                    .min()
-                    .unwrap_or(0);
-                return Err(TsinkError::OutOfRetention { timestamp: ts });
-            }
-
-            self.append_partition(None)?;
-            if self.data_path.is_some() {
-                self.schedule_flush_partitions();
-            }
-            extra_partitions += 1;
-            pending_rows = remaining;
-        }
-
-        Ok(())
-    }
-
-    fn load_disk_partitions(&self, data_path: &Path) -> Result<()> {
-        let entries = fs::read_dir(data_path)?;
-        let mut partitions = Vec::new();
-
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir()
-                && let Some(name) = path.file_name()
-            {
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("p-") {
-                    match DiskPartition::open(&path, self.retention) {
-                        Ok(partition) => {
-                            partitions.push(Arc::new(partition) as SharedPartition);
-                        }
-                        Err(TsinkError::NoDataPoints { .. }) => continue,
-                        Err(TsinkError::InvalidPartition { .. }) => continue,
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-        }
-
-        partitions.sort_by_key(|p| p.min_timestamp());
-        for partition in partitions {
-            self.partition_list.insert(partition);
-        }
-
-        Ok(())
-    }
-
-    fn build_partition(&self, partition: Option<SharedPartition>) -> SharedPartition {
-        if let Some(p) = partition {
-            p
-        } else {
-            let mem_partition = Arc::new(MemoryPartition::new(
-                self.wal.clone(),
-                self.partition_duration,
-                self.timestamp_precision,
-                self.retention,
-            ));
-
-            mem_partition as SharedPartition
-        }
-    }
-
-    fn new_partition(&self, partition: Option<SharedPartition>) -> Result<()> {
-        let partition = self.build_partition(partition);
-        self.wal.punctuate()?;
-        self.partition_list.insert(partition);
-        Ok(())
-    }
-
-    fn append_partition(&self, partition: Option<SharedPartition>) -> Result<()> {
-        let partition = self.build_partition(partition);
-        // Keep WAL segmentation consistent with partition lifecycle for recovery.
-        self.wal.punctuate()?;
-        self.partition_list.insert_tail(partition);
-        Ok(())
-    }
-
-    fn active_partition_count(&self) -> usize {
-        self.partition_list
-            .iter()
-            .filter(|p| p.active() && !p.expired())
-            .count()
-    }
-
-    fn ensure_active_head(&self) -> Result<()> {
-        if self.active_partition_count() >= WRITABLE_PARTITIONS_NUM {
-            return Ok(());
-        }
-
-        let _guard = self.partition_creation_lock.lock();
-
-        let mut created = 0usize;
-        while self.active_partition_count() < WRITABLE_PARTITIONS_NUM {
-            self.new_partition(None)?;
-            created += 1;
-        }
-
-        if created > 0 && self.data_path.is_some() {
-            self.schedule_flush_partitions();
-        }
-
-        Ok(())
-    }
-
-    fn schedule_flush_partitions(&self) {
-        let mut slot = self.flush_thread.lock();
-
-        if let Some(handle) = slot.as_ref()
-            && !handle.is_finished()
-        {
-            return;
-        }
-
-        if let Some(handle) = slot.take() {
-            let _ = handle.join();
-        }
-
-        let storage = self.clone_refs();
-        *slot = Some(thread::spawn(move || {
-            if let Err(e) = storage.flush_partitions() {
-                error!("Failed to flush partitions: {}", e);
-            }
-        }));
-    }
-
-    fn collect_flush_candidates(&self, skip_head: usize) -> Vec<SharedPartition> {
-        let _partition_ops_guard = self.partition_ops_lock.read();
-        let mut partitions_to_flush = Vec::new();
-        let mut i = 0usize;
-
-        for partition in self.partition_list.iter() {
-            if i < skip_head {
-                i += 1;
-                continue;
-            }
-
-            if partition.size() == 0 {
-                continue;
-            }
-
-            partitions_to_flush.push(partition);
-        }
-
-        partitions_to_flush
-    }
-
-    fn flush_partitions(&self) -> Result<()> {
-        let partitions_to_flush = self.collect_flush_candidates(WRITABLE_PARTITIONS_NUM);
-
-        for partition in partitions_to_flush {
-            if let Some(data_path) = &self.data_path {
-                if !partition.begin_flush() {
-                    continue;
-                }
-
-                let prepared = match self.flush_memory_partition_to_disk(&partition, data_path) {
-                    Ok(prepared) => prepared,
-                    Err(e) => {
-                        partition.end_flush();
-                        error!("Failed to flush partition: {}", e);
-                        continue;
-                    }
-                };
-
-                let Some(flushed_partition) = prepared else {
-                    partition.end_flush();
-                    continue;
-                };
-
-                let swapped = {
-                    let _partition_ops_guard = self.partition_ops_lock.write();
-                    self.partition_list
-                        .swap(&partition, flushed_partition.clone())
-                };
-
-                match swapped {
-                    Ok(()) => {}
-                    Err(TsinkError::PartitionNotFound { .. }) => {
-                        partition.end_flush();
-                        let _ = flushed_partition.clean();
-                    }
-                    Err(e) => {
-                        partition.end_flush();
-                        let _ = flushed_partition.clean();
-                        return Err(e);
-                    }
-                }
-            } else {
-                let remove_result = {
-                    let _partition_ops_guard = self.partition_ops_lock.write();
-                    self.partition_list.remove(&partition)
-                };
-
-                match remove_result {
-                    Ok(()) | Err(TsinkError::PartitionNotFound { .. }) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn flush_all_partitions(&self) -> Result<()> {
-        let partitions_to_flush = self.collect_flush_candidates(0);
-
-        for partition in partitions_to_flush {
-            if let Some(data_path) = &self.data_path {
-                if !partition.begin_flush() {
-                    continue;
-                }
-
-                let prepared = match self.flush_memory_partition_to_disk(&partition, data_path)? {
-                    Some(prepared) => prepared,
-                    None => {
-                        partition.end_flush();
-                        continue;
-                    }
-                };
-
-                let swap_result = {
-                    let _partition_ops_guard = self.partition_ops_lock.write();
-                    self.partition_list.swap(&partition, prepared.clone())
-                };
-
-                if let Err(e) = swap_result {
-                    partition.end_flush();
-                    let _ = prepared.clean();
-                    return Err(e);
-                }
-            } else {
-                let remove_result = {
-                    let _partition_ops_guard = self.partition_ops_lock.write();
-                    self.partition_list.remove(&partition)
-                };
-                if let Err(e) = remove_result {
-                    if matches!(e, TsinkError::PartitionNotFound { .. }) {
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn flush_memory_partition_to_disk(
-        &self,
-        partition: &SharedPartition,
-        data_path: &Path,
-    ) -> Result<Option<SharedPartition>> {
-        if partition.size() == 0 {
-            return Ok(None);
-        }
-
-        let dir_path = self.next_partition_dir(partition, data_path)?;
-
-        match partition.flush_to_disk()? {
-            Some((data, meta)) => {
-                let disk_partition =
-                    crate::disk::DiskPartition::create(&dir_path, meta, data, self.retention)?;
-                Ok(Some(Arc::new(disk_partition) as SharedPartition))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn next_partition_dir(&self, partition: &SharedPartition, data_path: &Path) -> Result<PathBuf> {
-        let base = format!(
-            "p-{}-{}",
-            partition.min_timestamp(),
-            partition.max_timestamp()
-        );
-        let mut candidate = data_path.join(&base);
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-
-        for suffix in 1u64.. {
-            candidate = data_path.join(format!("{base}-{suffix}"));
-            if !candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-
-        Err(TsinkError::Other(
-            "unable to allocate unique partition directory".to_string(),
-        ))
-    }
-
-    fn remove_expired_partitions(&self) -> Result<()> {
-        let _partition_ops_guard = self.partition_ops_lock.write();
-        let mut expired = Vec::new();
-
-        for partition in self.partition_list.iter() {
-            if partition.expired() {
-                expired.push(partition);
-            }
-        }
-
-        for partition in expired {
-            self.partition_list.remove(&partition)?;
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn expiry_check_interval(&self) -> Duration {
-        Duration::from_millis(50)
-    }
-
-    #[cfg(not(test))]
-    fn expiry_check_interval(&self) -> Duration {
-        if self.retention.is_zero() {
-            return Duration::from_secs(3600);
-        }
-
-        let interval = self.retention / 10;
-        interval.clamp(Duration::from_secs(1), Duration::from_secs(3600))
-    }
-
-    fn start_background_tasks(&self) {
-        let (stop_tx, stop_rx) = bounded::<()>(1);
-        *self.expiry_stop_tx.lock() = Some(stop_tx);
-
-        let storage = self.clone_refs();
-        let interval = storage.expiry_check_interval();
-        let handle = thread::spawn(move || {
-            loop {
-                match stop_rx.recv_timeout(interval) {
-                    Ok(_) => break,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        if storage.lifecycle.load(Ordering::SeqCst) != STORAGE_OPEN {
-                            break;
-                        }
-
-                        if let Err(e) = storage.remove_expired_partitions() {
-                            error!("Failed to remove expired partitions: {}", e);
-                        }
-                    }
-                }
-            }
-        });
-        *self.expiry_thread.lock() = Some(handle);
-    }
-
-    fn stop_background_tasks(&self) {
-        if let Some(tx) = self.expiry_stop_tx.lock().take() {
-            let _ = tx.try_send(());
-        }
-
-        if let Some(handle) = self.expiry_thread.lock().take() {
-            if handle.thread().id() == thread::current().id() {
-                drop(handle);
-            } else {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    fn stop_flush_worker(&self) {
-        if let Some(handle) = self.flush_thread.lock().take() {
-            if handle.thread().id() == thread::current().id() {
-                drop(handle);
-            } else {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    fn clone_refs(&self) -> Arc<StorageImpl> {
-        Arc::new(StorageImpl {
-            partition_list: self.partition_list.clone(),
-            data_path: self.data_path.clone(),
-            use_disk_wal: self.use_disk_wal,
-            partition_duration: self.partition_duration,
-            retention: self.retention,
-            timestamp_precision: self.timestamp_precision,
-            write_timeout: self.write_timeout,
-            wal: self.wal.clone(),
-            workers_semaphore: self.workers_semaphore.clone(),
-            lifecycle: self.lifecycle.clone(),
-            partition_creation_lock: self.partition_creation_lock.clone(),
-            partition_ops_lock: self.partition_ops_lock.clone(),
-            expiry_thread: self.expiry_thread.clone(),
-            expiry_stop_tx: self.expiry_stop_tx.clone(),
-            flush_thread: self.flush_thread.clone(),
-            primary_instance: false,
-        })
-    }
-}
-
-impl Storage for StorageImpl {
-    fn insert_rows(&self, rows: &[Row]) -> Result<()> {
-        self.ensure_operational()?;
-
-        let _guard = match self.workers_semaphore.try_acquire_for(self.write_timeout) {
-            Ok(guard) => guard,
-            Err(TsinkError::WriteTimeout { .. }) => {
-                return match self.lifecycle.load(Ordering::SeqCst) {
-                    STORAGE_CLOSING => Err(TsinkError::StorageShuttingDown),
-                    STORAGE_CLOSED => Err(TsinkError::StorageClosed),
-                    _ => Err(TsinkError::WriteTimeout {
-                        timeout_ms: self.write_timeout.as_millis() as u64,
-                        workers: self.workers_semaphore.capacity(),
-                    }),
-                };
-            }
-            Err(err) => return Err(err),
-        };
-
-        self.ensure_operational()?;
-        self.insert_rows_internal(rows)
-    }
-
-    fn select(
-        &self,
-        metric: &str,
-        labels: &[Label],
-        start: i64,
-        end: i64,
-    ) -> Result<Vec<DataPoint>> {
-        self.ensure_operational()?;
-        Self::validate_metric_name(metric)?;
-        Self::validate_labels(labels)?;
-
-        if start >= end {
-            return Err(TsinkError::InvalidTimeRange { start, end });
-        }
-
-        let _partition_ops_guard = self.partition_ops_lock.read();
-        let mut all_points = Vec::new();
-
-        for partition in self.partition_list.iter() {
-            if partition.size() == 0 || partition.expired() {
-                continue;
-            }
-
-            match partition.select_data_points(metric, labels, start, end) {
-                Ok(points) => all_points.extend(points),
-                Err(TsinkError::NoDataPoints { .. }) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-
-        all_points.sort_by_key(|p| p.timestamp);
-
-        Ok(all_points)
-    }
-
-    fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>> {
-        self.ensure_operational()?;
-        Self::validate_metric_name(metric)?;
-        Self::validate_labels(&opts.labels)?;
-
-        if opts.start >= opts.end {
-            return Err(TsinkError::InvalidTimeRange {
-                start: opts.start,
-                end: opts.end,
-            });
-        }
-
-        if let Some(d) = opts.downsample
-            && d.interval <= 0
-        {
-            return Err(TsinkError::InvalidConfiguration(
-                "downsample interval must be positive".to_string(),
-            ));
-        }
-
-        let points = self.select(metric, &opts.labels, opts.start, opts.end)?;
-
-        let aggregation = match (opts.downsample.is_some(), opts.aggregation) {
-            (true, Aggregation::None) => Aggregation::Last, // sensible default for downsampling
-            _ => opts.aggregation,
-        };
-
-        let mut processed = if let Some(custom) = opts.custom_aggregation {
-            if let Some(downsample) = opts.downsample {
-                downsample_points_with_custom(
-                    &points,
-                    downsample.interval,
-                    custom.as_ref(),
-                    opts.start,
-                    opts.end,
-                )?
-            } else {
-                custom
-                    .aggregate_series(&points)?
-                    .into_iter()
-                    .collect::<Vec<DataPoint>>()
-            }
-        } else if let Some(downsample) = opts.downsample {
-            downsample_points(
-                &points,
-                downsample.interval,
-                aggregation,
-                opts.start,
-                opts.end,
-            )?
-        } else if aggregation != Aggregation::None {
-            aggregate_series(&points, aggregation)?
-                .into_iter()
-                .collect::<Vec<DataPoint>>()
-        } else {
-            points
-        };
-
-        if opts.offset > 0 && opts.offset < processed.len() {
-            processed.drain(0..opts.offset);
-        } else if opts.offset >= processed.len() {
-            processed.clear();
-        }
-
-        if let Some(limit) = opts.limit {
-            processed.truncate(limit);
-        }
-
-        Ok(processed)
-    }
-
-    fn select_all(
-        &self,
-        metric: &str,
-        start: i64,
-        end: i64,
-    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
-        self.ensure_operational()?;
-        Self::validate_metric_name(metric)?;
-
-        if start >= end {
-            return Err(TsinkError::InvalidTimeRange { start, end });
-        }
-
-        let _partition_ops_guard = self.partition_ops_lock.read();
-        let mut results_map: std::collections::HashMap<Vec<Label>, Vec<DataPoint>> =
-            std::collections::HashMap::new();
-
-        for partition in self.partition_list.iter() {
-            if partition.size() == 0 {
-                continue;
-            }
-
-            if partition.expired() {
-                continue;
-            }
-
-            match partition.select_all_labels(metric, start, end) {
-                Ok(partition_results) => {
-                    for (labels, points) in partition_results {
-                        results_map.entry(labels).or_default().extend(points);
-                    }
-                }
-                Err(TsinkError::NoDataPoints { .. }) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-
-        let mut results: Vec<(Vec<Label>, Vec<DataPoint>)> = results_map
-            .into_iter()
-            .map(|(labels, mut points)| {
-                points.sort_by_key(|p| p.timestamp);
-                (labels, points)
-            })
-            .collect();
-
-        results.sort_by(|a, b| a.0.cmp(&b.0));
-
-        Ok(results)
-    }
-
-    fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
-        self.list_metrics_internal(false)
-    }
-
-    fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
-        self.list_metrics_internal(true)
-    }
-
-    fn close(&self) -> Result<()> {
-        let state = self.lifecycle.compare_exchange(
-            STORAGE_OPEN,
-            STORAGE_CLOSING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-        if state.is_err() {
-            return match self.lifecycle.load(Ordering::SeqCst) {
-                STORAGE_CLOSING => Err(TsinkError::StorageShuttingDown),
-                _ => Err(TsinkError::StorageClosed),
-            };
-        }
-
-        // Stop background workers first to avoid resource retention while closing.
-        self.stop_background_tasks();
-
-        let close_result = (|| -> Result<()> {
-            let _writer_guards = self.workers_semaphore.acquire_all(self.write_timeout)?;
-
-            // Ensure no flush worker is racing with close-time flush/removal.
-            self.stop_flush_worker();
-
-            self.wal.flush()?;
-
-            if self.data_path.is_none() {
-                return Ok(());
-            }
-
-            for _ in 0..WRITABLE_PARTITIONS_NUM {
-                self.new_partition(None)?;
-            }
-
-            self.flush_all_partitions()?;
-
-            self.remove_expired_partitions()?;
-
-            self.wal.remove_all()?;
-
-            Ok(())
-        })();
-
-        match close_result {
-            Ok(()) => {
-                self.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(err) => {
-                self.lifecycle.store(STORAGE_OPEN, Ordering::SeqCst);
-                self.start_background_tasks();
-                Err(err)
-            }
-        }
-    }
-}
-
-impl Drop for StorageImpl {
-    fn drop(&mut self) {
-        if !self.primary_instance {
-            return;
-        }
-
-        self.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
-        self.stop_background_tasks();
-        self.stop_flush_worker();
     }
 }
 
@@ -1373,9 +409,9 @@ fn value_cmp(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering> {
         (Value::F64(a), Value::U64(b)) => Ok(a.total_cmp(&(*b as f64))),
         (Value::I64(a), Value::F64(b)) => Ok((*a as f64).total_cmp(b)),
         (Value::I64(a), Value::I64(b)) => Ok(a.cmp(b)),
-        (Value::I64(a), Value::U64(b)) => Ok((*a as f64).total_cmp(&(*b as f64))),
+        (Value::I64(a), Value::U64(b)) => Ok((*a as i128).cmp(&(*b as i128))),
         (Value::U64(a), Value::F64(b)) => Ok((*a as f64).total_cmp(b)),
-        (Value::U64(a), Value::I64(b)) => Ok((*a as f64).total_cmp(&(*b as f64))),
+        (Value::U64(a), Value::I64(b)) => Ok((*a as i128).cmp(&(*b as i128))),
         (Value::U64(a), Value::U64(b)) => Ok(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
         (Value::Bytes(a), Value::Bytes(b)) => Ok(a.cmp(b)),
@@ -1558,6 +594,44 @@ fn range_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
             Value::U64(max.saturating_sub(min))
         }
         NumericDomain::Mixed => {
+            // Preserve integer precision when the mixed set is i64/u64 only.
+            let mut int_min: Option<i128> = None;
+            let mut int_max: Option<i128> = None;
+            let mut has_f64 = false;
+
+            for point in points {
+                match &point.value {
+                    Value::I64(v) => {
+                        let value = *v as i128;
+                        int_min = Some(int_min.map_or(value, |min| min.min(value)));
+                        int_max = Some(int_max.map_or(value, |max| max.max(value)));
+                    }
+                    Value::U64(v) => {
+                        let value = *v as i128;
+                        int_min = Some(int_min.map_or(value, |min| min.min(value)));
+                        int_max = Some(int_max.map_or(value, |max| max.max(value)));
+                    }
+                    Value::F64(v) if v.is_nan() => {}
+                    Value::F64(_) => {
+                        has_f64 = true;
+                        break;
+                    }
+                    _ => {
+                        return Err(TsinkError::UnsupportedAggregation {
+                            aggregation: aggregation_name(Aggregation::Range).to_string(),
+                            value_type: point.value.kind().to_string(),
+                        });
+                    }
+                }
+            }
+
+            if !has_f64 {
+                let (Some(min), Some(max)) = (int_min, int_max) else {
+                    return Ok(None);
+                };
+                return Ok(Some(Value::F64((max - min) as f64)));
+            }
+
             let values = numeric_values_f64(points, Aggregation::Range)?;
             if values.is_empty() {
                 return Ok(None);
@@ -1600,14 +674,13 @@ fn population_variance_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
     Ok(Some(Value::F64(m2 / count)))
 }
 
-fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Result<Option<DataPoint>> {
-    if points.is_empty() {
+pub(crate) fn aggregate_series(
+    points: &[DataPoint],
+    aggregation: Aggregation,
+) -> Result<Option<DataPoint>> {
+    let Some(last) = points.last() else {
         return Ok(None);
-    }
-
-    let last = points
-        .last()
-        .ok_or_else(|| TsinkError::Other("aggregation on empty series".to_string()))?;
+    };
 
     let aggregated = match aggregation {
         Aggregation::None => None,
@@ -1656,13 +729,9 @@ fn aggregate_bucket(
     aggregation: Aggregation,
     bucket_start: i64,
 ) -> Result<Option<DataPoint>> {
-    if points.is_empty() {
+    let Some(last) = points.last() else {
         return Ok(None);
-    }
-
-    let last = points
-        .last()
-        .ok_or_else(|| TsinkError::Other("aggregation on empty bucket".to_string()))?;
+    };
 
     let aggregated = match aggregation {
         Aggregation::None => None,
@@ -1710,7 +779,7 @@ fn aggregate_bucket(
     Ok(aggregated)
 }
 
-fn downsample_points(
+pub(crate) fn downsample_points(
     points: &[DataPoint],
     interval: i64,
     aggregation: Aggregation,
@@ -1759,7 +828,7 @@ fn downsample_points(
     Ok(result)
 }
 
-fn downsample_points_with_custom(
+pub(crate) fn downsample_points_with_custom(
     points: &[DataPoint],
     interval: i64,
     aggregation: &dyn BytesAggregation,
@@ -1810,381 +879,43 @@ fn downsample_points_with_custom(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::Path;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-    use tempfile::TempDir;
+    use super::aggregate_series;
+    use crate::{Aggregation, DataPoint, Value};
 
-    struct RecoveryTestPartition {
-        fail_recovery: bool,
-    }
+    #[test]
+    fn mixed_i64_u64_min_max_use_integer_order_for_large_values() {
+        let larger = i64::MAX;
+        let smaller = (i64::MAX as u64).saturating_sub(1);
 
-    impl RecoveryTestPartition {
-        fn new(fail_recovery: bool) -> Self {
-            Self { fail_recovery }
-        }
-    }
-
-    impl crate::partition::Partition for RecoveryTestPartition {
-        fn insert_rows(&self, _rows: &[Row]) -> Result<Vec<Row>> {
-            Ok(Vec::new())
-        }
-
-        fn insert_rows_recovery(&self, _rows: &[Row]) -> Result<Vec<Row>> {
-            if self.fail_recovery {
-                return Err(TsinkError::Other("forced replay failure".to_string()));
-            }
-
-            Ok(Vec::new())
-        }
-
-        fn select_data_points(
-            &self,
-            _metric: &str,
-            _labels: &[Label],
-            _start: i64,
-            _end: i64,
-        ) -> Result<Vec<DataPoint>> {
-            Ok(Vec::new())
-        }
-
-        fn select_all_labels(
-            &self,
-            _metric: &str,
-            _start: i64,
-            _end: i64,
-        ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
-            Ok(Vec::new())
-        }
-
-        fn list_metric_series(&self) -> Result<Vec<(String, Vec<Label>)>> {
-            Ok(Vec::new())
-        }
-
-        fn min_timestamp(&self) -> i64 {
-            1
-        }
-
-        fn max_timestamp(&self) -> i64 {
-            1
-        }
-
-        fn size(&self) -> usize {
-            0
-        }
-
-        fn active(&self) -> bool {
-            true
-        }
-
-        fn expired(&self) -> bool {
-            false
-        }
-
-        fn clean(&self) -> Result<()> {
-            Ok(())
-        }
-
-        fn flush_to_disk(&self) -> Result<Option<(Vec<u8>, crate::disk::PartitionMeta)>> {
-            Ok(None)
-        }
-    }
-
-    fn wal_segment_count(dir: &Path) -> usize {
-        fs::read_dir(dir)
+        let min_points = vec![
+            DataPoint::new(1, Value::I64(larger)),
+            DataPoint::new(2, Value::U64(smaller)),
+        ];
+        let min = aggregate_series(&min_points, Aggregation::Min)
             .unwrap()
-            .flatten()
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "wal"))
-            .count()
-    }
-
-    #[test]
-    fn memory_mode_removes_expired_partitions_in_background() {
-        let storage = StorageBuilder::new()
-            .with_retention(Duration::from_millis(50))
-            .with_timestamp_precision(TimestampPrecision::Milliseconds)
-            .with_partition_duration(Duration::from_millis(10))
-            .build_impl()
             .unwrap();
+        assert_eq!(min.value, Value::U64(smaller));
 
-        let row = Row::new("metric", DataPoint::new(1, 1.0));
-        storage.insert_rows(&[row]).unwrap();
-
-        let partition_with_data = storage
-            .partition_list
-            .iter()
-            .find(|partition| partition.size() > 0)
-            .expect("expected partition with data");
-        let weak_partition = Arc::downgrade(&partition_with_data);
-        drop(partition_with_data);
-
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while weak_partition.upgrade().is_some() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        assert!(
-            weak_partition.upgrade().is_none(),
-            "expired memory partition should be dropped"
-        );
-
-        storage.close().unwrap();
-    }
-
-    #[test]
-    fn build_rejects_partition_duration_too_small_for_precision() {
-        let result = StorageBuilder::new()
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_partition_duration(Duration::from_millis(1))
-            .build_impl();
-
-        assert!(matches!(result, Err(TsinkError::InvalidConfiguration(_))));
-    }
-
-    #[test]
-    fn build_rejects_positive_retention_too_small_for_precision() {
-        let result = StorageBuilder::new()
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_retention(Duration::from_millis(1))
-            .build_impl();
-
-        assert!(matches!(result, Err(TsinkError::InvalidConfiguration(_))));
-    }
-
-    #[test]
-    fn close_failure_keeps_storage_operational_for_retry() {
-        let storage = StorageBuilder::new()
-            .with_write_timeout(Duration::from_millis(1))
-            .build_impl()
-            .unwrap();
-
-        let permit = storage
-            .workers_semaphore
-            .try_acquire_for(Duration::from_secs(1))
-            .unwrap();
-
-        let err = storage.close().unwrap_err();
-        assert!(matches!(err, TsinkError::WriteTimeout { .. }));
-        drop(permit);
-
-        storage
-            .insert_rows(&[Row::new("close_retry", DataPoint::new(1, 1.0))])
-            .unwrap();
-        storage.close().unwrap();
-    }
-
-    #[test]
-    fn insert_batch_spanning_more_than_two_windows_is_accepted() {
-        let storage = StorageBuilder::new()
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_partition_duration(Duration::from_secs(60))
-            .build_impl()
-            .unwrap();
-
-        let rows = vec![
-            Row::new("wide_span", DataPoint::new(10_000, 1.0)),
-            Row::new("wide_span", DataPoint::new(9_900, 2.0)),
-            Row::new("wide_span", DataPoint::new(9_700, 3.0)),
+        let max_points = vec![
+            DataPoint::new(1, Value::U64(smaller)),
+            DataPoint::new(2, Value::I64(larger)),
         ];
-
-        storage.insert_rows(&rows).unwrap();
-        let points = storage.select("wide_span", &[], 0, i64::MAX).unwrap();
-        assert_eq!(points.len(), 3);
-
-        storage.close().unwrap();
+        let max = aggregate_series(&max_points, Aggregation::Max)
+            .unwrap()
+            .unwrap();
+        assert_eq!(max.value, Value::I64(larger));
     }
 
     #[test]
-    fn backfilled_rows_are_appended_to_older_partitions() {
-        let storage = StorageBuilder::new()
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_partition_duration(Duration::from_secs(60))
-            .build_impl()
-            .unwrap();
-
-        let rows = vec![
-            Row::new("ordering", DataPoint::new(1_000, 1.0)),
-            Row::new("ordering", DataPoint::new(100, 2.0)),
-            Row::new("ordering", DataPoint::new(-900, 3.0)),
-        ];
-
-        storage.insert_rows(&rows).unwrap();
-
-        let mins: Vec<i64> = storage
-            .partition_list
-            .iter()
-            .filter(|partition| partition.size() > 0)
-            .map(|partition| partition.min_timestamp())
-            .collect();
-
-        assert!(
-            mins.len() >= 3,
-            "expected three non-empty partitions, got {mins:?}"
-        );
-        assert!(
-            mins.windows(2).all(|pair| pair[0] >= pair[1]),
-            "partitions must stay ordered newest->oldest, got {mins:?}"
-        );
-
-        storage.close().unwrap();
-    }
-
-    #[test]
-    fn insert_waiting_on_permit_returns_shutdown_error_when_closing_begins() {
-        let storage = StorageBuilder::new()
-            .with_max_writers(1)
-            .with_write_timeout(Duration::from_millis(25))
-            .build_impl()
-            .unwrap();
-
-        let permit = storage
-            .workers_semaphore
-            .try_acquire_for(Duration::from_secs(1))
-            .unwrap();
-
-        let storage_for_insert = storage.clone_refs();
-        let handle = std::thread::spawn(move || {
-            storage_for_insert.insert_rows(&[Row::new("shutdown", DataPoint::new(1, 1.0))])
-        });
-
-        std::thread::sleep(Duration::from_millis(5));
-        storage.lifecycle.store(STORAGE_CLOSING, Ordering::SeqCst);
-
-        let result = handle.join().unwrap();
-        assert!(matches!(result, Err(TsinkError::StorageShuttingDown)));
-
-        storage.lifecycle.store(STORAGE_OPEN, Ordering::SeqCst);
-        drop(permit);
-        storage.close().unwrap();
-    }
-
-    #[test]
-    fn replay_failure_does_not_clear_wal_segments() {
-        let temp_dir = TempDir::new().unwrap();
-        let wal_dir = temp_dir.path().join("wal");
-
-        let disk_wal = DiskWal::new(&wal_dir, 0).unwrap();
-        let wal: Arc<dyn Wal> = disk_wal;
-        wal.append_rows(&[Row::new("recover_metric", DataPoint::new(1, 1.0))])
-            .unwrap();
-        wal.flush().unwrap();
-        let segments_before = wal_segment_count(&wal_dir);
-        assert!(segments_before > 0);
-
-        let storage = StorageImpl {
-            partition_list: Arc::new(PartitionList::new()),
-            data_path: None,
-            use_disk_wal: false,
-            partition_duration: Duration::from_secs(60),
-            retention: Duration::from_secs(3600),
-            timestamp_precision: TimestampPrecision::Nanoseconds,
-            write_timeout: Duration::from_secs(1),
-            wal: wal.clone(),
-            workers_semaphore: Arc::new(Semaphore::new(1)),
-            lifecycle: Arc::new(AtomicU8::new(STORAGE_OPEN)),
-            partition_creation_lock: Arc::new(parking_lot::Mutex::new(())),
-            partition_ops_lock: Arc::new(parking_lot::RwLock::new(())),
-            expiry_thread: Arc::new(parking_lot::Mutex::new(None)),
-            expiry_stop_tx: Arc::new(parking_lot::Mutex::new(None)),
-            flush_thread: Arc::new(parking_lot::Mutex::new(None)),
-            primary_instance: true,
-        };
-
-        storage.partition_list.insert(
-            Arc::new(RecoveryTestPartition::new(false)) as crate::partition::SharedPartition
-        );
-        storage.partition_list.insert(
-            Arc::new(RecoveryTestPartition::new(true)) as crate::partition::SharedPartition,
-        );
-
-        let replay_result = storage.recover_from_wal(&wal_dir);
-        assert!(matches!(replay_result, Err(TsinkError::Other(_))));
-        assert_eq!(wal_segment_count(&wal_dir), segments_before);
-    }
-
-    #[test]
-    fn drop_without_close_stops_background_workers() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = StorageBuilder::new()
-            .with_data_path(temp_dir.path())
-            .build_impl()
-            .unwrap();
-
-        storage.schedule_flush_partitions();
-
-        let lifecycle = storage.lifecycle.clone();
-        let expiry_thread = storage.expiry_thread.clone();
-        let expiry_stop_tx = storage.expiry_stop_tx.clone();
-        let flush_thread = storage.flush_thread.clone();
-
-        drop(storage);
-
-        assert_eq!(lifecycle.load(Ordering::SeqCst), STORAGE_CLOSED);
-        assert!(expiry_stop_tx.lock().is_none());
-        assert!(expiry_thread.lock().is_none());
-        assert!(flush_thread.lock().is_none());
-    }
-
-    #[test]
-    fn crash_recovery_keeps_rows_when_partial_flush_persists_only_oldest_partition() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let storage = StorageBuilder::new()
-            .with_data_path(temp_dir.path())
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_partition_duration(Duration::from_secs(60))
-            .build_impl()
-            .unwrap();
-
-        storage
-            .insert_rows(&[
-                Row::new("wal_gc_guard", DataPoint::new(300, 1.0)),
-                Row::new("wal_gc_guard", DataPoint::new(230, 2.0)),
-                Row::new("wal_gc_guard", DataPoint::new(160, 3.0)),
-            ])
-            .unwrap();
-
-        // Make flush progression deterministic for this test.
-        storage.stop_flush_worker();
-        storage.flush_partitions().unwrap();
-        storage.stop_flush_worker();
-
-        // Simulate abrupt shutdown: drop without close() so recovery relies on WAL.
-        drop(storage);
-
-        let reopened = StorageBuilder::new()
-            .with_data_path(temp_dir.path())
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_partition_duration(Duration::from_secs(60))
-            .build_impl()
-            .unwrap();
-
-        let points = reopened.select("wal_gc_guard", &[], 0, 1_000).unwrap();
-        let timestamps: std::collections::BTreeSet<i64> =
-            points.iter().map(|point| point.timestamp).collect();
-
-        assert!(timestamps.contains(&300));
-        assert!(timestamps.contains(&230));
-        assert!(timestamps.contains(&160));
-
-        reopened.close().unwrap();
-    }
-
-    #[test]
-    fn downsample_sparse_points_skips_empty_buckets() {
+    fn mixed_i64_u64_range_preserves_unit_difference_at_high_values() {
         let points = vec![
-            DataPoint::new(5, 1.0),
-            DataPoint::new(1_000_005, 2.0),
-            DataPoint::new(2_000_005, 3.0),
+            DataPoint::new(1, Value::I64(i64::MAX - 1)),
+            DataPoint::new(2, Value::U64(i64::MAX as u64)),
         ];
 
-        let result = downsample_points(&points, 1, Aggregation::Last, 0, 3_000_000).unwrap();
-
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], DataPoint::new(5, 1.0));
-        assert_eq!(result[1], DataPoint::new(1_000_005, 2.0));
-        assert_eq!(result[2], DataPoint::new(2_000_005, 3.0));
+        let range = aggregate_series(&points, Aggregation::Range)
+            .unwrap()
+            .unwrap();
+        assert_eq!(range.value, Value::F64(1.0));
     }
 }

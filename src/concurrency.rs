@@ -368,12 +368,17 @@ impl<T: Send + 'static> WorkerPool<T> {
         Ok(())
     }
 
-    /// Shuts down the worker pool gracefully.
-    pub fn shutdown(mut self) -> Result<()> {
-        info!("Shutting down worker pool");
+    fn shutdown_internal(&mut self, completion_timeout: Duration) -> Result<()> {
         self.shutdown.store(true, Ordering::Release);
 
-        self.wait_for_completion(Duration::from_secs(30))?;
+        let mut first_error = None;
+        if let Err(err) = self.wait_for_completion(completion_timeout) {
+            error!(
+                "Timed out waiting for worker pool tasks to complete: {}",
+                err
+            );
+            first_error = Some(err);
+        }
 
         for _ in &self.workers {
             let _ = self.sender.send(Message::Shutdown);
@@ -383,12 +388,38 @@ impl<T: Send + 'static> WorkerPool<T> {
             if let Some(thread) = worker.thread.take() {
                 match thread.join() {
                     Ok(_) => info!("Worker {} shut down successfully", worker.id),
-                    Err(_) => error!("Worker {} panicked during shutdown", worker.id),
+                    Err(_) => {
+                        error!("Worker {} panicked during shutdown", worker.id);
+                        if first_error.is_none() {
+                            first_error = Some(TsinkError::Other(format!(
+                                "worker {} panicked during shutdown",
+                                worker.id
+                            )));
+                        }
+                    }
                 }
             }
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Shuts down the worker pool gracefully.
+    pub fn shutdown(mut self) -> Result<()> {
+        info!("Shutting down worker pool");
+        self.shutdown_internal(Duration::from_secs(30))
+    }
+}
+
+impl<T: Send + 'static> Drop for WorkerPool<T> {
+    fn drop(&mut self) {
+        if self.workers.iter().all(|worker| worker.thread.is_none()) {
+            return;
+        }
+
+        if let Err(err) = self.shutdown_internal(Duration::from_secs(30)) {
+            warn!("WorkerPool drop encountered shutdown error: {}", err);
+        }
     }
 }
 
@@ -518,6 +549,50 @@ mod tests {
 
         pool.shutdown().unwrap();
         assert_eq!(counter.load(Ordering::Acquire), 32);
+    }
+
+    #[test]
+    fn test_worker_pool_drop_waits_for_in_flight_task() {
+        let task_started = Arc::new(AtomicBool::new(false));
+        let task_finished = Arc::new(AtomicBool::new(false));
+        let task_started_clone = Arc::clone(&task_started);
+        let task_finished_clone = Arc::clone(&task_finished);
+        let (release_tx, release_rx) = bounded::<()>(1);
+
+        let pool = WorkerPool::new(1, move |_value: usize| {
+            task_started_clone.store(true, Ordering::Release);
+            let _ = release_rx.recv();
+            task_finished_clone.store(true, Ordering::Release);
+        });
+
+        pool.submit(1).unwrap();
+
+        let start = Instant::now();
+        while !task_started.load(Ordering::Acquire) {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "worker did not start task in time"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let (drop_started_tx, drop_started_rx) = bounded::<()>(1);
+        let drop_handle = thread::spawn(move || {
+            let _ = drop_started_tx.send(());
+            drop(pool);
+        });
+        drop_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !drop_handle.is_finished(),
+            "WorkerPool drop returned before in-flight task completed"
+        );
+
+        release_tx.send(()).unwrap();
+        drop_handle.join().unwrap();
+        assert!(task_finished.load(Ordering::Acquire));
     }
 
     #[test]

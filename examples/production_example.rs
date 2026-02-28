@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         StorageBuilder::new()
             .with_data_path("./tsink-data")
             .with_retention(Duration::from_secs(7 * 24 * 3600)) // 7 days
-            .with_partition_duration(Duration::from_secs(3600)) // 1 hour
+            .with_chunk_points(4096)
             .with_timestamp_precision(TimestampPrecision::Nanoseconds)
             .with_write_timeout(Duration::from_secs(30))
             .with_wal_buffer_size(4096)

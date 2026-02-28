@@ -1,37 +1,7 @@
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-use std::time::Duration;
-
 use tempfile::TempDir;
-use tsink::encoding::MetricEncoding;
 use tsink::{
     Aggregation, Aggregator, Codec, DataPoint, QueryOptions, Row, StorageBuilder, TsinkError, Value,
 };
-
-fn collect_metric_encodings(data_path: &Path) -> HashMap<String, MetricEncoding> {
-    let mut out = HashMap::new();
-
-    for entry in fs::read_dir(data_path).unwrap().flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let meta_path = path.join(tsink::disk::META_FILE_NAME);
-        if !meta_path.exists() {
-            continue;
-        }
-
-        let meta: tsink::disk::PartitionMeta =
-            serde_json::from_reader(fs::File::open(meta_path).unwrap()).unwrap();
-        for metric in meta.metrics.values() {
-            out.insert(metric.name.clone(), metric.encoding);
-        }
-    }
-
-    out
-}
 
 #[derive(Clone)]
 struct U32Codec;
@@ -65,56 +35,20 @@ impl Aggregator<u32> for SumU32 {
 }
 
 #[test]
-fn hybrid_encoding_selection_covers_supported_types() {
+fn rejects_mixed_numeric_types_within_series() {
     let temp_dir = TempDir::new().unwrap();
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
-        .with_wal_enabled(false)
-        .with_partition_duration(Duration::from_secs(3600))
         .build()
         .unwrap();
 
-    storage
+    let err = storage
         .insert_rows(&[
-            Row::new("f64_metric", DataPoint::new(1, 1.0f64)),
-            Row::new("f64_metric", DataPoint::new(2, 2.0f64)),
-            Row::new("i64_metric", DataPoint::new(1, -1i64)),
-            Row::new("i64_metric", DataPoint::new(2, 2i64)),
-            Row::new("u64_metric", DataPoint::new(1, 1u64)),
-            Row::new("u64_metric", DataPoint::new(2, 2u64)),
-            Row::new("bool_metric", DataPoint::new(1, false)),
-            Row::new("bool_metric", DataPoint::new(2, true)),
-            Row::new("bytes_metric", DataPoint::new(1, Value::Bytes(vec![1]))),
-            Row::new("bytes_metric", DataPoint::new(2, Value::Bytes(vec![2]))),
-            Row::new("string_metric", DataPoint::new(1, "a")),
-            Row::new("string_metric", DataPoint::new(2, "b")),
             Row::new("mixed_metric", DataPoint::new(1, 1.0f64)),
             Row::new("mixed_metric", DataPoint::new(2, 2i64)),
         ])
-        .unwrap();
-
-    storage.close().unwrap();
-
-    let encodings = collect_metric_encodings(temp_dir.path());
-    assert_eq!(
-        encodings.get("f64_metric"),
-        Some(&MetricEncoding::GorillaF64)
-    );
-    assert_eq!(
-        encodings.get("i64_metric"),
-        Some(&MetricEncoding::GorillaI64)
-    );
-    assert_eq!(
-        encodings.get("u64_metric"),
-        Some(&MetricEncoding::GorillaU64)
-    );
-    assert_eq!(
-        encodings.get("bool_metric"),
-        Some(&MetricEncoding::GorillaBool)
-    );
-    assert_eq!(encodings.get("bytes_metric"), Some(&MetricEncoding::Typed));
-    assert_eq!(encodings.get("string_metric"), Some(&MetricEncoding::Typed));
-    assert_eq!(encodings.get("mixed_metric"), Some(&MetricEncoding::Typed));
+        .unwrap_err();
+    assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
 }
 
 #[test]
@@ -258,7 +192,6 @@ fn unsupported_and_mixed_type_aggregations_return_errors() {
             Row::new("str_metric", DataPoint::new(1, "a")),
             Row::new("str_metric", DataPoint::new(2, "b")),
             Row::new("mixed_metric", DataPoint::new(1, 1i64)),
-            Row::new("mixed_metric", DataPoint::new(2, "x")),
         ])
         .unwrap();
 
@@ -274,10 +207,7 @@ fn unsupported_and_mixed_type_aggregations_return_errors() {
     ));
 
     let mismatch = storage
-        .select_with_options(
-            "mixed_metric",
-            QueryOptions::new(0, 10).with_aggregation(Aggregation::Min),
-        )
+        .insert_rows(&[Row::new("mixed_metric", DataPoint::new(2, "x"))])
         .unwrap_err();
     assert!(matches!(mismatch, TsinkError::ValueTypeMismatch { .. }));
 }

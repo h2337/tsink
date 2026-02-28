@@ -56,16 +56,18 @@ fn bench_select_among_thousand_points(c: &mut Criterion) {
     storage.insert_rows(&rows).unwrap();
 
     c.bench_function("select_1000_points", |b| {
+        let mut points = Vec::with_capacity(1024);
         b.iter(|| {
-            let points = storage
-                .select(
+            storage
+                .select_into(
                     black_box("select_metric"),
                     black_box(&[]),
                     black_box(1600000000),
                     black_box(1600001000),
+                    &mut points,
                 )
                 .unwrap();
-            black_box(points);
+            black_box(&points);
         });
     });
 }
@@ -98,16 +100,18 @@ fn bench_select_among_million_points(c: &mut Criterion) {
         .unwrap();
 
     c.bench_function("select_1M_points", |b| {
+        let mut points = Vec::with_capacity(1024);
         b.iter(|| {
-            let points = storage
-                .select(
+            storage
+                .select_into(
                     black_box("million_metric"),
                     black_box(&[]),
                     black_box(1600500000), // Select from middle (500k to 501k)
                     black_box(1600501000), // 1000 points
+                    &mut points,
                 )
                 .unwrap();
-            black_box(points);
+            black_box(&points);
         });
     });
 }

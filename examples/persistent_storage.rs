@@ -1,4 +1,4 @@
-//! Example showing persistent storage with disk partitions.
+//! Example showing persistent storage with immutable segment files.
 
 use std::time::Duration;
 use tempfile::TempDir;
@@ -12,8 +12,8 @@ fn main() -> anyhow::Result<()> {
 
     let storage = StorageBuilder::new()
         .with_data_path(data_path)
-        .with_partition_duration(Duration::from_secs(3600)) // 1 hour partitions
         .with_retention(Duration::from_secs(24 * 3600)) // 24 hour retention
+        .with_chunk_points(2048)
         .with_timestamp_precision(TimestampPrecision::Milliseconds)
         .build()?;
 

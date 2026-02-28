@@ -208,13 +208,13 @@ impl Div<f64> for &Value {
 
 impl Sum<Value> for f64 {
     fn sum<I: Iterator<Item = Value>>(iter: I) -> Self {
-        iter.fold(0.0, |acc, value| acc + value.as_f64().unwrap_or(f64::NAN))
+        iter.filter_map(|value| value.as_f64()).sum()
     }
 }
 
 impl<'a> Sum<&'a Value> for f64 {
     fn sum<I: Iterator<Item = &'a Value>>(iter: I) -> Self {
-        iter.fold(0.0, |acc, value| acc + value.as_f64().unwrap_or(f64::NAN))
+        iter.filter_map(|value| value.as_f64()).sum()
     }
 }
 
@@ -395,6 +395,30 @@ mod tests {
         let values = vec![Value::I64(1), Value::U64(2), Value::F64(3.5)];
         let sum: f64 = values.into_iter().sum();
         assert!((sum - 6.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sum_over_value_iter_ignores_non_numeric_values() {
+        let values = vec![
+            Value::I64(1),
+            Value::String("x".to_string()),
+            Value::Bool(true),
+            Value::F64(2.5),
+        ];
+        let sum: f64 = values.into_iter().sum();
+        assert!((sum - 3.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sum_over_value_ref_iter_ignores_non_numeric_values() {
+        let values = vec![
+            Value::U64(2),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::String("y".to_string()),
+            Value::F64(1.5),
+        ];
+        let sum: f64 = values.iter().sum();
+        assert!((sum - 3.5).abs() < 1e-12);
     }
 
     #[test]

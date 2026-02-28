@@ -2,10 +2,8 @@
 //!
 //! tsink is a Rust implementation of a time-series storage engine with a straightforward API.
 
-pub mod bstream;
 pub mod cgroup;
 pub mod concurrency;
-pub mod encoding;
 pub mod engine;
 pub mod error;
 pub mod label;

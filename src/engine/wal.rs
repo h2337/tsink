@@ -571,19 +571,7 @@ fn read_bytes<'a>(payload: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a 
 }
 
 fn checksum32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for byte in bytes {
-        let mut c = crc ^ (*byte as u32);
-        for _ in 0..8 {
-            c = if c & 1 == 1 {
-                0xEDB8_8320u32 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-        }
-        crc = c;
-    }
-    !crc
+    crc32fast::hash(bytes)
 }
 
 #[cfg(test)]

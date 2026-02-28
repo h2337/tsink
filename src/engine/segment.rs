@@ -1442,31 +1442,11 @@ fn tmp_path_for(path: &Path) -> PathBuf {
 }
 
 fn hash64(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    xxhash_rust::xxh64::xxh64(bytes, 0)
 }
 
 fn checksum32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for byte in bytes {
-        let mut c = crc ^ (*byte as u32);
-        for _ in 0..8 {
-            c = if c & 1 == 1 {
-                0xEDB8_8320u32 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-        }
-        crc = c;
-    }
-    !crc
+    crc32fast::hash(bytes)
 }
 
 fn encode_uvarint(mut value: u64, out: &mut Vec<u8>) {

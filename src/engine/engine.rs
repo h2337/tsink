@@ -185,6 +185,24 @@ struct PendingPoint {
     value: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RawSeriesKey {
+    metric: String,
+    labels: Vec<Label>,
+}
+
+impl RawSeriesKey {
+    fn new(metric: &str, labels: &[Label]) -> Self {
+        let mut normalized_labels = labels.to_vec();
+        normalized_labels.sort();
+        normalized_labels.dedup();
+        Self {
+            metric: metric.to_string(),
+            labels: normalized_labels,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SealedChunkKey {
     min_ts: i64,
@@ -270,8 +288,8 @@ pub struct ChunkStorage {
     lifecycle: Arc<AtomicU8>,
     compaction_lock: Arc<Mutex<()>>,
     flush_visibility_lock: RwLock<()>,
-    compaction_thread: Option<std::thread::Thread>,
-    flush_thread: Mutex<Option<std::thread::Thread>>,
+    compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ChunkStorage {
@@ -284,6 +302,7 @@ impl ChunkStorage {
             1,
             ChunkStorageOptions::default(),
         )
+        .expect("failed to initialize chunk storage")
     }
 
     pub fn new_with_data_path(
@@ -301,6 +320,7 @@ impl ChunkStorage {
             next_segment_id,
             ChunkStorageOptions::default(),
         )
+        .expect("failed to initialize chunk storage")
     }
 
     fn new_with_data_path_and_options(
@@ -310,7 +330,7 @@ impl ChunkStorage {
         blob_lane_path: Option<PathBuf>,
         next_segment_id: u64,
         options: ChunkStorageOptions,
-    ) -> Self {
+    ) -> Result<Self> {
         let next_segment_id = Arc::new(AtomicU64::new(next_segment_id.max(1)));
         let numeric_compactor = numeric_lane_path.as_ref().map(|path| {
             Compactor::new_with_segment_id_allocator(
@@ -337,10 +357,10 @@ impl ChunkStorage {
                 options.compaction_interval,
             )
         } else {
-            None
+            Ok(None)
         };
 
-        Self {
+        Ok(Self {
             registry: RwLock::new(SeriesRegistry::new()),
             materialized_series: RwLock::new(BTreeSet::new()),
             registry_write_txn_shards: std::array::from_fn(|_| Mutex::new(())),
@@ -372,9 +392,9 @@ impl ChunkStorage {
             lifecycle,
             compaction_lock,
             flush_visibility_lock: RwLock::new(()),
-            compaction_thread,
+            compaction_thread: Mutex::new(compaction_thread?),
             flush_thread: Mutex::new(None),
-        }
+        })
     }
 
     fn series_shard_idx(series_id: SeriesId) -> usize {
@@ -442,9 +462,9 @@ impl ChunkStorage {
         numeric_compactor: Option<Compactor>,
         blob_compactor: Option<Compactor>,
         compaction_interval: Duration,
-    ) -> Option<std::thread::Thread> {
+    ) -> Result<Option<std::thread::JoinHandle<()>>> {
         if numeric_compactor.is_none() && blob_compactor.is_none() {
-            return None;
+            return Ok(None);
         }
 
         let handle = std::thread::Builder::new()
@@ -465,24 +485,21 @@ impl ChunkStorage {
                 let _compaction_guard = compaction_lock.lock();
                 let _ =
                     Self::compact_compactors(numeric_compactor.as_ref(), blob_compactor.as_ref());
-            })
-            .ok()?;
+            })?;
 
-        let thread = handle.thread().clone();
-        drop(handle);
-        Some(thread)
+        Ok(Some(handle))
     }
 
     fn notify_compaction_thread(&self) {
-        if let Some(compaction_thread) = &self.compaction_thread {
-            compaction_thread.unpark();
+        if let Some(compaction_thread) = self.compaction_thread.lock().as_ref() {
+            compaction_thread.thread().unpark();
         }
     }
 
     fn spawn_background_flush_thread(
         storage: std::sync::Weak<Self>,
         flush_interval: Duration,
-    ) -> Option<std::thread::Thread> {
+    ) -> Result<Option<std::thread::JoinHandle<()>>> {
         let handle = std::thread::Builder::new()
             .name("tsink-flush".to_string())
             .spawn(move || loop {
@@ -499,31 +516,63 @@ impl ChunkStorage {
                 }
 
                 let _ = storage.flush_pipeline_once();
-            })
-            .ok()?;
+            })?;
 
-        let thread = handle.thread().clone();
-        drop(handle);
-        Some(thread)
+        Ok(Some(handle))
     }
 
-    fn start_background_flush_thread(self: &Arc<Self>, flush_interval: Duration) {
+    fn start_background_flush_thread(self: &Arc<Self>, flush_interval: Duration) -> Result<()> {
         if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
-            return;
+            return Ok(());
         }
 
         let mut flush_thread = self.flush_thread.lock();
         if flush_thread.is_some() {
-            return;
+            return Ok(());
         }
 
-        *flush_thread = Self::spawn_background_flush_thread(Arc::downgrade(self), flush_interval);
+        *flush_thread = Self::spawn_background_flush_thread(Arc::downgrade(self), flush_interval)?;
+        Ok(())
     }
 
     fn notify_flush_thread(&self) {
         if let Some(flush_thread) = self.flush_thread.lock().as_ref() {
-            flush_thread.unpark();
+            flush_thread.thread().unpark();
         }
+    }
+
+    fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+        let payload = match payload.downcast::<String>() {
+            Ok(message) => return *message,
+            Err(payload) => payload,
+        };
+        let payload = match payload.downcast::<&'static str>() {
+            Ok(message) => return (*message).to_string(),
+            Err(payload) => payload,
+        };
+        format!("unknown panic payload type: {:?}", payload.type_id())
+    }
+
+    fn join_background_thread(
+        handle: std::thread::JoinHandle<()>,
+        worker_name: &str,
+    ) -> Result<()> {
+        handle.join().map_err(|payload| {
+            TsinkError::Other(format!(
+                "{worker_name} worker panicked: {}",
+                Self::panic_payload_message(payload)
+            ))
+        })
+    }
+
+    fn join_background_threads(&self) -> Result<()> {
+        if let Some(compaction_thread) = self.compaction_thread.lock().take() {
+            Self::join_background_thread(compaction_thread, "compaction")?;
+        }
+        if let Some(flush_thread) = self.flush_thread.lock().take() {
+            Self::join_background_thread(flush_thread, "flush")?;
+        }
+        Ok(())
     }
 
     fn flush_pipeline_once(&self) -> Result<()> {
@@ -635,6 +684,26 @@ impl ChunkStorage {
 
     fn cardinality_limit_value(&self) -> usize {
         self.cardinality_limit
+    }
+
+    fn projected_new_series_count(registry: &SeriesRegistry, rows: &[Row]) -> Result<usize> {
+        let mut pending_new_series = HashSet::<RawSeriesKey>::new();
+
+        for row in rows {
+            validate_metric(row.metric())?;
+            validate_labels(row.labels())?;
+
+            if registry
+                .resolve_existing(row.metric(), row.labels())
+                .is_some()
+            {
+                continue;
+            }
+
+            pending_new_series.insert(RawSeriesKey::new(row.metric(), row.labels()));
+        }
+
+        Ok(pending_new_series.len())
     }
 
     fn wal_size_limit_value(&self) -> u64 {
@@ -2401,6 +2470,19 @@ impl Storage for ChunkStorage {
             let mut registry = self.registry.write();
 
             if let Err(err) = (|| -> Result<()> {
+                let cardinality_limit = self.cardinality_limit_value();
+                if cardinality_limit != usize::MAX {
+                    let current = registry.series_count();
+                    let requested = Self::projected_new_series_count(&registry, rows)?;
+                    if requested > 0 && current.saturating_add(requested) > cardinality_limit {
+                        return Err(TsinkError::CardinalityLimitExceeded {
+                            limit: cardinality_limit,
+                            current,
+                            requested,
+                        });
+                    }
+                }
+
                 for row in rows {
                     let data_point = row.data_point();
                     let lane = lane_for_value(&data_point.value);
@@ -2421,18 +2503,6 @@ impl Storage for ChunkStorage {
                         ts: data_point.timestamp,
                         value: data_point.value.clone(),
                     });
-                }
-
-                let cardinality_limit = self.cardinality_limit_value();
-                if cardinality_limit != usize::MAX && !created_series.is_empty() {
-                    let current = registry.series_count();
-                    if current > cardinality_limit {
-                        return Err(TsinkError::CardinalityLimitExceeded {
-                            limit: cardinality_limit,
-                            current,
-                            requested: created_series.len(),
-                        });
-                    }
                 }
 
                 Ok(())
@@ -2702,7 +2772,7 @@ impl Storage for ChunkStorage {
         self.notify_compaction_thread();
         self.notify_flush_thread();
 
-        let close_result = (|| {
+        let mut close_result = (|| {
             let _write_permits = self.write_limiter.acquire_all(self.write_timeout)?;
             self.flush_all_active()?;
             self.persist_segment(true)?;
@@ -2716,11 +2786,16 @@ impl Storage for ChunkStorage {
 
         if close_result.is_ok() {
             self.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
+            self.notify_compaction_thread();
+            self.notify_flush_thread();
+            if let Err(err) = self.join_background_threads() {
+                close_result = Err(err);
+            }
         } else {
             self.lifecycle.store(STORAGE_OPEN, Ordering::SeqCst);
+            self.notify_compaction_thread();
+            self.notify_flush_thread();
         }
-        self.notify_compaction_thread();
-        self.notify_flush_thread();
 
         close_result
     }
@@ -2737,6 +2812,7 @@ impl Drop for ChunkStorage {
         self.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
         self.notify_compaction_thread();
         self.notify_flush_thread();
+        let _ = self.join_background_threads();
     }
 }
 
@@ -2815,7 +2891,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         blob_lane_path,
         loaded_segments.next_segment_id,
         storage_options,
-    ));
+    )?);
     storage.apply_loaded_segment_indexes(loaded_segments)?;
     storage.replay_from_wal(replay_highwater)?;
     storage.sweep_expired_persisted_segments()?;
@@ -2824,7 +2900,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         storage.enforce_memory_budget_if_needed()?;
     }
     if wal_enabled {
-        storage.start_background_flush_thread(DEFAULT_FLUSH_INTERVAL);
+        storage.start_background_flush_thread(DEFAULT_FLUSH_INTERVAL)?;
     }
 
     Ok(storage as Arc<dyn Storage>)
@@ -3823,26 +3899,29 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
-            8,
-            None,
-            None,
-            None,
-            1,
-            ChunkStorageOptions {
-                retention_window: i64::MAX,
-                retention_enforced: false,
-                partition_window: i64::MAX,
-                max_writers: 2,
-                write_timeout: Duration::from_secs(2),
-                memory_budget_bytes: u64::MAX,
-                cardinality_limit: usize::MAX,
-                wal_size_limit_bytes: u64::MAX,
-                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
-                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
-                background_threads_enabled: true,
-            },
-        ));
+        let storage = Arc::new(
+            ChunkStorage::new_with_data_path_and_options(
+                8,
+                None,
+                None,
+                None,
+                1,
+                ChunkStorageOptions {
+                    retention_window: i64::MAX,
+                    retention_enforced: false,
+                    partition_window: i64::MAX,
+                    max_writers: 2,
+                    write_timeout: Duration::from_secs(2),
+                    memory_budget_bytes: u64::MAX,
+                    cardinality_limit: usize::MAX,
+                    wal_size_limit_bytes: u64::MAX,
+                    admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+                    compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                    background_threads_enabled: true,
+                },
+            )
+            .unwrap(),
+        );
 
         let active_read_guards = storage
             .active_builders
@@ -3887,26 +3966,29 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
-            8,
-            None,
-            None,
-            None,
-            1,
-            ChunkStorageOptions {
-                retention_window: i64::MAX,
-                retention_enforced: false,
-                partition_window: i64::MAX,
-                max_writers: 2,
-                write_timeout: Duration::from_secs(2),
-                memory_budget_bytes: u64::MAX,
-                cardinality_limit: usize::MAX,
-                wal_size_limit_bytes: u64::MAX,
-                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
-                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
-                background_threads_enabled: true,
-            },
-        ));
+        let storage = Arc::new(
+            ChunkStorage::new_with_data_path_and_options(
+                8,
+                None,
+                None,
+                None,
+                1,
+                ChunkStorageOptions {
+                    retention_window: i64::MAX,
+                    retention_enforced: false,
+                    partition_window: i64::MAX,
+                    max_writers: 2,
+                    write_timeout: Duration::from_secs(2),
+                    memory_budget_bytes: u64::MAX,
+                    cardinality_limit: usize::MAX,
+                    wal_size_limit_bytes: u64::MAX,
+                    admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+                    compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                    background_threads_enabled: true,
+                },
+            )
+            .unwrap(),
+        );
         let labels = vec![Label::new("host", "a")];
         let metric_a = "registry_shard_metric_a";
         let metric_a_shard = ChunkStorage::registry_metric_shard_idx(metric_a);
@@ -3995,26 +4077,29 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let wal =
             FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
-        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
-            8,
-            Some(wal),
-            None,
-            None,
-            1,
-            ChunkStorageOptions {
-                retention_window: i64::MAX,
-                retention_enforced: false,
-                partition_window: i64::MAX,
-                max_writers: 2,
-                write_timeout: Duration::from_secs(2),
-                memory_budget_bytes: u64::MAX,
-                cardinality_limit: usize::MAX,
-                wal_size_limit_bytes: u64::MAX,
-                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
-                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
-                background_threads_enabled: true,
-            },
-        ));
+        let storage = Arc::new(
+            ChunkStorage::new_with_data_path_and_options(
+                8,
+                Some(wal),
+                None,
+                None,
+                1,
+                ChunkStorageOptions {
+                    retention_window: i64::MAX,
+                    retention_enforced: false,
+                    partition_window: i64::MAX,
+                    max_writers: 2,
+                    write_timeout: Duration::from_secs(2),
+                    memory_budget_bytes: u64::MAX,
+                    cardinality_limit: usize::MAX,
+                    wal_size_limit_bytes: u64::MAX,
+                    admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+                    compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                    background_threads_enabled: true,
+                },
+            )
+            .unwrap(),
+        );
         let labels = vec![Label::new("host", "a")];
         let start = Arc::new(Barrier::new(3));
         let (tx, rx) = mpsc::channel();
@@ -4585,7 +4670,8 @@ mod tests {
                 compaction_interval: Duration::from_millis(25),
                 background_threads_enabled: true,
             },
-        );
+        )
+        .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut compacted = false;
@@ -4613,15 +4699,20 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
         let labels = vec![Label::new("host", "a")];
-        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
-            2,
-            None,
-            Some(lane_path.clone()),
-            None,
-            1,
-            ChunkStorageOptions::default(),
-        ));
-        storage.start_background_flush_thread(Duration::from_millis(25));
+        let storage = Arc::new(
+            ChunkStorage::new_with_data_path_and_options(
+                2,
+                None,
+                Some(lane_path.clone()),
+                None,
+                1,
+                ChunkStorageOptions::default(),
+            )
+            .unwrap(),
+        );
+        storage
+            .start_background_flush_thread(Duration::from_millis(25))
+            .unwrap();
 
         storage
             .insert_rows(&[
@@ -4708,7 +4799,8 @@ mod tests {
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: false,
             },
-        );
+        )
+        .unwrap();
 
         storage
             .insert_rows(&[Row::with_labels(
@@ -5004,7 +5096,8 @@ mod tests {
             Some(blob_lane_path),
             1,
             ChunkStorageOptions::default(),
-        );
+        )
+        .unwrap();
         let numeric_labels = vec![Label::new("kind", "numeric")];
         let blob_labels = vec![Label::new("kind", "blob")];
         storage
@@ -5050,7 +5143,8 @@ mod tests {
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
-        );
+        )
+        .unwrap();
 
         let labels = vec![Label::new("host", "a")];
         storage
@@ -5104,7 +5198,8 @@ mod tests {
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
-        );
+        )
+        .unwrap();
 
         storage
             .insert_rows(&[
@@ -5241,6 +5336,73 @@ mod tests {
             .select("cardinality_guard_metric", &labels_b, 0, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn cardinality_limit_rejection_does_not_grow_string_dictionaries() {
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            4,
+            None,
+            None,
+            None,
+            1,
+            ChunkStorageOptions {
+                cardinality_limit: 1,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap();
+        let baseline_labels = vec![Label::new("host", "baseline")];
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                "cardinality_dict_guard_metric",
+                baseline_labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let (baseline_metric_len, baseline_label_name_len, baseline_label_value_len) = {
+            let registry = storage.registry.read();
+            (
+                registry.metric_dictionary_len(),
+                registry.label_name_dictionary_len(),
+                registry.label_value_dictionary_len(),
+            )
+        };
+
+        for attempt in 0..16 {
+            let err = storage
+                .insert_rows(&[Row::with_labels(
+                    format!("cardinality_dict_leak_metric_{attempt}"),
+                    vec![Label::new(
+                        format!("dict_name_{attempt}"),
+                        format!("dict_value_{attempt}"),
+                    )],
+                    DataPoint::new(2, attempt as f64),
+                )])
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                TsinkError::CardinalityLimitExceeded { limit: 1, .. }
+            ));
+        }
+
+        let (metric_len, label_name_len, label_value_len) = {
+            let registry = storage.registry.read();
+            (
+                registry.metric_dictionary_len(),
+                registry.label_name_dictionary_len(),
+                registry.label_value_dictionary_len(),
+            )
+        };
+
+        assert_eq!(metric_len, baseline_metric_len);
+        assert_eq!(label_name_len, baseline_label_name_len);
+        assert_eq!(label_value_len, baseline_label_value_len);
+
+        storage.close().unwrap();
     }
 
     #[test]
@@ -5497,7 +5659,8 @@ mod tests {
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: false,
             },
-        );
+        )
+        .unwrap();
         storage
             .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap())
             .unwrap();
@@ -5634,7 +5797,8 @@ mod tests {
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
-        );
+        )
+        .unwrap();
 
         let _held_permit = storage.write_limiter.acquire();
         let err = storage
@@ -5673,7 +5837,8 @@ mod tests {
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
-        );
+        )
+        .unwrap();
 
         let _held_permit = storage.write_limiter.acquire();
         let err = storage
@@ -5709,7 +5874,8 @@ mod tests {
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
-        );
+        )
+        .unwrap();
 
         storage
             .insert_rows(&[
@@ -5734,26 +5900,29 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
-            8,
-            None,
-            None,
-            None,
-            1,
-            ChunkStorageOptions {
-                retention_window: i64::MAX,
-                retention_enforced: false,
-                partition_window: i64::MAX,
-                max_writers: 1,
-                write_timeout: Duration::from_secs(2),
-                memory_budget_bytes: u64::MAX,
-                cardinality_limit: usize::MAX,
-                wal_size_limit_bytes: u64::MAX,
-                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
-                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
-                background_threads_enabled: true,
-            },
-        ));
+        let storage = Arc::new(
+            ChunkStorage::new_with_data_path_and_options(
+                8,
+                None,
+                None,
+                None,
+                1,
+                ChunkStorageOptions {
+                    retention_window: i64::MAX,
+                    retention_enforced: false,
+                    partition_window: i64::MAX,
+                    max_writers: 1,
+                    write_timeout: Duration::from_secs(2),
+                    memory_budget_bytes: u64::MAX,
+                    cardinality_limit: usize::MAX,
+                    wal_size_limit_bytes: u64::MAX,
+                    admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+                    compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                    background_threads_enabled: true,
+                },
+            )
+            .unwrap(),
+        );
         let labels = vec![Label::new("host", "a")];
 
         let held_permit = storage.write_limiter.acquire();

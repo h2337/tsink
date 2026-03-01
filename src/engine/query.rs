@@ -123,14 +123,22 @@ pub fn decode_encoded_chunk_payload_in_range_into(
     end: i64,
     out: &mut Vec<DataPoint>,
 ) -> Result<()> {
-    let decoded = Encoder::decode_chunk_points_from_payload(
+    let decoded = Encoder::decode_chunk_points_from_payload_in_range(
         descriptor.lane,
         descriptor.ts_codec,
         descriptor.value_codec,
         descriptor.point_count,
         payload,
+        start,
+        end,
     )?;
-    append_sorted_owned_chunk_points_in_range(decoded, start, end, out);
+    out.reserve(decoded.len());
+    for point in decoded {
+        out.push(DataPoint {
+            timestamp: point.ts,
+            value: point.value,
+        });
+    }
     Ok(())
 }
 
@@ -153,27 +161,6 @@ fn append_sorted_chunk_points_in_range(
         out.push(DataPoint {
             timestamp: point.ts,
             value: point.value.clone(),
-        });
-    }
-}
-
-fn append_sorted_owned_chunk_points_in_range(
-    points: Vec<super::chunk::ChunkPoint>,
-    start: i64,
-    end: i64,
-    out: &mut Vec<DataPoint>,
-) {
-    let first = points.partition_point(|point| point.ts < start);
-    let last = points.partition_point(|point| point.ts < end);
-    out.reserve(last.saturating_sub(first));
-    for point in points
-        .into_iter()
-        .skip(first)
-        .take(last.saturating_sub(first))
-    {
-        out.push(DataPoint {
-            timestamp: point.ts,
-            value: point.value,
         });
     }
 }

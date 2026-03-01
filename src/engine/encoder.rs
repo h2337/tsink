@@ -154,6 +154,62 @@ impl Encoder {
             .map(|(ts, value)| ChunkPoint { ts, value })
             .collect())
     }
+
+    pub fn decode_chunk_points_from_payload_in_range(
+        lane: ValueLane,
+        ts_codec: TimestampCodecId,
+        value_codec: ValueCodecId,
+        point_count: usize,
+        payload: &[u8],
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<ChunkPoint>> {
+        if point_count == 0 || start >= end {
+            return Ok(Vec::new());
+        }
+
+        let mut pos = 0usize;
+        let ts_len = read_u32(payload, &mut pos)? as usize;
+        let ts_payload = read_bytes(payload, &mut pos, ts_len)?;
+        let value_len = read_u32(payload, &mut pos)? as usize;
+        let value_payload = read_bytes(payload, &mut pos, value_len)?;
+
+        if pos != payload.len() {
+            return Err(TsinkError::DataCorruption(
+                "encoded chunk payload has trailing bytes".to_string(),
+            ));
+        }
+
+        let timestamps = decode_timestamps(ts_codec, ts_payload, point_count)?;
+        let first = timestamps.partition_point(|ts| *ts < start);
+        let last = timestamps.partition_point(|ts| *ts < end);
+
+        if first >= last {
+            return Ok(Vec::new());
+        }
+
+        let values = decode_values_in_index_range(
+            value_codec,
+            lane,
+            value_payload,
+            point_count,
+            first,
+            last,
+        )?;
+
+        if values.len() != last.saturating_sub(first) {
+            return Err(TsinkError::DataCorruption(
+                "timestamp/value count mismatch after range decode".to_string(),
+            ));
+        }
+
+        Ok(timestamps[first..last]
+            .iter()
+            .copied()
+            .zip(values)
+            .map(|(ts, value)| ChunkPoint { ts, value })
+            .collect())
+    }
 }
 
 fn choose_best_timestamp_codec(points: &[ChunkPoint]) -> Result<(TimestampCodecId, Vec<u8>)> {
@@ -694,6 +750,43 @@ fn decode_values(
     }
 }
 
+fn decode_values_in_index_range(
+    codec: ValueCodecId,
+    lane: ValueLane,
+    payload: &[u8],
+    point_count: usize,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
+    if point_count == 0 || start_idx >= end_idx {
+        return Ok(Vec::new());
+    }
+    if end_idx > point_count {
+        return Err(TsinkError::DataCorruption(format!(
+            "value index range [{start_idx}, {end_idx}) exceeds point count {point_count}",
+        )));
+    }
+
+    match codec {
+        ValueCodecId::ConstantRle => decode_values_constant_rle_range(payload, start_idx, end_idx),
+        ValueCodecId::GorillaXorF64 => {
+            decode_values_f64_xor_range(payload, point_count, start_idx, end_idx)
+        }
+        ValueCodecId::ZigZagDeltaBitpackI64 => {
+            decode_values_i64_delta_range(payload, point_count, start_idx, end_idx)
+        }
+        ValueCodecId::DeltaBitpackU64 => {
+            decode_values_u64_delta_range(payload, point_count, start_idx, end_idx)
+        }
+        ValueCodecId::BoolBitpack => {
+            decode_values_bool_bitpack_range(payload, point_count, start_idx, end_idx)
+        }
+        ValueCodecId::BytesDeltaBlock => {
+            decode_values_blob_delta_block_range(payload, point_count, lane, start_idx, end_idx)
+        }
+    }
+}
+
 fn decode_values_constant_rle(payload: &[u8], point_count: usize) -> Result<Vec<Value>> {
     let (value, used) = decode_single_value(payload)?;
     if used != payload.len() {
@@ -703,6 +796,21 @@ fn decode_values_constant_rle(payload: &[u8], point_count: usize) -> Result<Vec<
     }
 
     Ok(std::iter::repeat_n(value, point_count).collect())
+}
+
+fn decode_values_constant_rle_range(
+    payload: &[u8],
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
+    let (value, used) = decode_single_value(payload)?;
+    if used != payload.len() {
+        return Err(TsinkError::DataCorruption(
+            "constant-rle payload has trailing bytes".to_string(),
+        ));
+    }
+
+    Ok(std::iter::repeat_n(value, end_idx.saturating_sub(start_idx)).collect())
 }
 
 fn decode_values_f64_xor(payload: &[u8], point_count: usize) -> Result<Vec<Value>> {
@@ -728,6 +836,44 @@ fn decode_values_f64_xor(payload: &[u8], point_count: usize) -> Result<Vec<Value
         let xor = u64::from_le_bytes(payload[start..end].try_into().unwrap_or([0; 8]));
         let bits = prev ^ xor;
         out.push(Value::F64(f64::from_bits(bits)));
+        prev = bits;
+    }
+
+    Ok(out)
+}
+
+fn decode_values_f64_xor_range(
+    payload: &[u8],
+    point_count: usize,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
+    if point_count == 0 || start_idx >= end_idx {
+        return Ok(Vec::new());
+    }
+
+    let expected_len = point_count.saturating_mul(8);
+    if payload.len() != expected_len {
+        return Err(TsinkError::DataCorruption(format!(
+            "f64 xor payload length mismatch: expected {expected_len}, got {}",
+            payload.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+    let mut prev = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
+    if start_idx == 0 {
+        out.push(Value::F64(f64::from_bits(prev)));
+    }
+
+    for idx in 1..end_idx {
+        let start = idx * 8;
+        let end = start + 8;
+        let xor = u64::from_le_bytes(payload[start..end].try_into().unwrap_or([0; 8]));
+        let bits = prev ^ xor;
+        if idx >= start_idx {
+            out.push(Value::F64(f64::from_bits(bits)));
+        }
         prev = bits;
     }
 
@@ -761,6 +907,49 @@ fn decode_values_i64_delta(payload: &[u8], point_count: usize) -> Result<Vec<Val
     }
 
     if pos != payload.len() {
+        return Err(TsinkError::DataCorruption(
+            "i64 delta payload has trailing bytes".to_string(),
+        ));
+    }
+
+    Ok(out)
+}
+
+fn decode_values_i64_delta_range(
+    payload: &[u8],
+    point_count: usize,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
+    if point_count == 0 || start_idx >= end_idx {
+        return Ok(Vec::new());
+    }
+    if payload.len() < 8 {
+        return Err(TsinkError::DataCorruption(
+            "i64 delta payload missing first value".to_string(),
+        ));
+    }
+
+    let mut pos = 0usize;
+    let mut prev = read_i64(payload, &mut pos)?;
+
+    let mut out = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+    if start_idx == 0 {
+        out.push(Value::I64(prev));
+    }
+
+    for idx in 1..end_idx {
+        let delta = decode_svarint(payload, &mut pos)?;
+        let next = prev.checked_add(delta).ok_or_else(|| {
+            TsinkError::DataCorruption("i64 delta overflow while decoding values".to_string())
+        })?;
+        if idx >= start_idx {
+            out.push(Value::I64(next));
+        }
+        prev = next;
+    }
+
+    if end_idx == point_count && pos != payload.len() {
         return Err(TsinkError::DataCorruption(
             "i64 delta payload has trailing bytes".to_string(),
         ));
@@ -803,6 +992,47 @@ fn decode_values_u64_delta(payload: &[u8], point_count: usize) -> Result<Vec<Val
     Ok(out)
 }
 
+fn decode_values_u64_delta_range(
+    payload: &[u8],
+    point_count: usize,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
+    if point_count == 0 || start_idx >= end_idx {
+        return Ok(Vec::new());
+    }
+    if payload.len() < 8 {
+        return Err(TsinkError::DataCorruption(
+            "u64 delta payload missing first value".to_string(),
+        ));
+    }
+
+    let mut pos = 0usize;
+    let mut prev = read_u64(payload, &mut pos)?;
+
+    let mut out = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+    if start_idx == 0 {
+        out.push(Value::U64(prev));
+    }
+
+    for idx in 1..end_idx {
+        let delta = decode_svarint(payload, &mut pos)?;
+        let next = prev.wrapping_add(delta as u64);
+        if idx >= start_idx {
+            out.push(Value::U64(next));
+        }
+        prev = next;
+    }
+
+    if end_idx == point_count && pos != payload.len() {
+        return Err(TsinkError::DataCorruption(
+            "u64 delta payload has trailing bytes".to_string(),
+        ));
+    }
+
+    Ok(out)
+}
+
 fn decode_values_bool_bitpack(payload: &[u8], point_count: usize) -> Result<Vec<Value>> {
     let expected_len = point_count.div_ceil(8);
     if payload.len() != expected_len {
@@ -814,6 +1044,31 @@ fn decode_values_bool_bitpack(payload: &[u8], point_count: usize) -> Result<Vec<
 
     let mut out = Vec::with_capacity(point_count);
     for idx in 0..point_count {
+        let byte_idx = idx / 8;
+        let bit_idx = idx % 8;
+        let value = (payload[byte_idx] >> bit_idx) & 1 == 1;
+        out.push(Value::Bool(value));
+    }
+
+    Ok(out)
+}
+
+fn decode_values_bool_bitpack_range(
+    payload: &[u8],
+    point_count: usize,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
+    let expected_len = point_count.div_ceil(8);
+    if payload.len() != expected_len {
+        return Err(TsinkError::DataCorruption(format!(
+            "bool bitpack payload length mismatch: expected {expected_len}, got {}",
+            payload.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+    for idx in start_idx..end_idx {
         let byte_idx = idx / 8;
         let bit_idx = idx % 8;
         let value = (payload[byte_idx] >> bit_idx) & 1 == 1;
@@ -861,6 +1116,71 @@ fn decode_values_blob_delta_block(
     }
 
     if pos != payload.len() {
+        return Err(TsinkError::DataCorruption(
+            "blob payload has trailing bytes".to_string(),
+        ));
+    }
+
+    Ok(out)
+}
+
+fn decode_values_blob_delta_block_range(
+    payload: &[u8],
+    point_count: usize,
+    lane: ValueLane,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
+    if lane != ValueLane::Blob {
+        return Err(TsinkError::ValueTypeMismatch {
+            expected: "blob lane".to_string(),
+            actual: "numeric lane".to_string(),
+        });
+    }
+
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+    for idx in 0..end_idx.min(point_count) {
+        let tag = *payload.get(pos).ok_or_else(|| {
+            TsinkError::DataCorruption("blob payload truncated while reading tag".to_string())
+        })?;
+        pos += 1;
+
+        let len = decode_uvarint(payload, &mut pos)? as usize;
+        let bytes = read_bytes(payload, &mut pos, len)?;
+
+        if idx < start_idx {
+            match tag {
+                5 => {}
+                6 => {
+                    std::str::from_utf8(bytes).map_err(|err| {
+                        TsinkError::DataCorruption(format!(
+                            "blob string payload is not valid UTF-8: {err}"
+                        ))
+                    })?;
+                }
+                _ => {
+                    return Err(TsinkError::DataCorruption(format!(
+                        "unknown blob value tag {tag}"
+                    )));
+                }
+            }
+            continue;
+        }
+
+        let value = match tag {
+            5 => Value::Bytes(bytes.to_vec()),
+            6 => Value::String(String::from_utf8(bytes.to_vec())?),
+            other => {
+                return Err(TsinkError::DataCorruption(format!(
+                    "unknown blob value tag {other}"
+                )));
+            }
+        };
+        out.push(value);
+    }
+
+    if end_idx == point_count && pos != payload.len() {
         return Err(TsinkError::DataCorruption(
             "blob payload has trailing bytes".to_string(),
         ));

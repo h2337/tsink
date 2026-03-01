@@ -1263,6 +1263,7 @@ dependencies = [
  "num_cpus",
  "parking_lot",
  "proptest",
+ "rayon",
  "regex",
  "serde",
  "serde_json",

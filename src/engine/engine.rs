@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
+use rayon::prelude::*;
 
 use crate::concurrency::Semaphore;
 use crate::engine::chunk::{Chunk, ChunkBuilder, ChunkPoint, ValueLane};
@@ -1350,21 +1351,34 @@ impl Storage for ChunkStorage {
             return Ok(Vec::new());
         }
 
-        let mut out = Vec::new();
-        for series_id in series_ids {
-            let points = self.collect_points_for_series(series_id, start, end)?;
-            if points.is_empty() {
-                continue;
-            }
+        let series_with_labels = {
+            let registry = self.registry.read();
+            series_ids
+                .into_iter()
+                .map(|series_id| {
+                    let labels = registry
+                        .decode_series_key(series_id)
+                        .map(|key| key.labels)
+                        .unwrap_or_default();
+                    (series_id, labels)
+                })
+                .collect::<Vec<_>>()
+        };
 
-            let labels = self
-                .registry
-                .read()
-                .decode_series_key(series_id)
-                .map(|key| key.labels)
-                .unwrap_or_default();
-            out.push((labels, points));
-        }
+        let mut out = series_with_labels
+            .into_par_iter()
+            .map(|(series_id, labels)| {
+                let points = self.collect_points_for_series(series_id, start, end)?;
+                if points.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some((labels, points)))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)

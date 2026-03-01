@@ -123,24 +123,59 @@ impl Semaphore {
 
     /// Acquires all permits, waiting up to timeout.
     pub fn acquire_all(&self, timeout: Duration) -> Result<Vec<SemaphoreGuard<'_>>> {
-        let deadline = Instant::now() + timeout;
-        let mut guards = Vec::with_capacity(self.max_permits);
+        let timeout_err = || TsinkError::WriteTimeout {
+            timeout_ms: timeout.as_millis() as u64,
+            workers: self.max_permits,
+        };
 
-        for _ in 0..self.max_permits {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(TsinkError::WriteTimeout {
-                    timeout_ms: timeout.as_millis() as u64,
-                    workers: self.max_permits,
-                });
+        if timeout.is_zero() {
+            if self
+                .permits
+                .compare_exchange(self.max_permits, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(timeout_err());
             }
 
-            let remaining = deadline.saturating_duration_since(now);
-            let guard = self.try_acquire_for(remaining)?;
-            guards.push(guard);
+            let mut guards = Vec::with_capacity(self.max_permits);
+            for _ in 0..self.max_permits {
+                guards.push(SemaphoreGuard { semaphore: self });
+            }
+            return Ok(guards);
         }
 
-        Ok(guards)
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .permits
+                .compare_exchange(self.max_permits, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let mut guards = Vec::with_capacity(self.max_permits);
+                for _ in 0..self.max_permits {
+                    guards.push(SemaphoreGuard { semaphore: self });
+                }
+                return Ok(guards);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(timeout_err());
+            }
+
+            let mut lock = self.mutex.lock();
+            while self.permits.load(Ordering::Acquire) != self.max_permits {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(timeout_err());
+                }
+                if self.condvar.wait_for(&mut lock, remaining).timed_out()
+                    && self.permits.load(Ordering::Acquire) != self.max_permits
+                {
+                    return Err(timeout_err());
+                }
+            }
+        }
     }
 
     /// Returns the semaphore capacity.
@@ -176,8 +211,8 @@ impl<'a> Drop for SemaphoreGuard<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::sync::{mpsc, Barrier};
     use std::thread;
     use std::time::Duration;
 
@@ -289,5 +324,31 @@ mod tests {
             result,
             Err(TsinkError::WriteTimeout { workers: 2, .. })
         ));
+    }
+
+    #[test]
+    fn concurrent_acquire_all_calls_do_not_split_permits() {
+        let sem = Arc::new(Semaphore::new(2));
+        let barrier = Arc::new(Barrier::new(3));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let sem = Arc::clone(&sem);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let guards = sem.acquire_all(Duration::from_millis(500)).unwrap();
+                thread::sleep(Duration::from_millis(25));
+                drop(guards);
+            }));
+        }
+
+        barrier.wait();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(sem.available_permits(), 2);
     }
 }

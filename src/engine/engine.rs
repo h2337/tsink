@@ -214,6 +214,12 @@ struct PersistedChunkRef {
     segment_slot: usize,
 }
 
+#[derive(Default)]
+struct PersistedIndexState {
+    chunk_refs: HashMap<SeriesId, Vec<PersistedChunkRef>>,
+    segment_maps: Vec<Arc<PlatformMmap>>,
+}
+
 const NUMERIC_LANE_ROOT: &str = "lane_numeric";
 const BLOB_LANE_ROOT: &str = "lane_blob";
 const WAL_DIR_NAME: &str = "wal";
@@ -224,8 +230,7 @@ pub struct ChunkStorage {
     active_builders: [RwLock<HashMap<SeriesId, ActiveSeriesState>>; IN_MEMORY_SHARD_COUNT],
     sealed_chunks:
         [RwLock<HashMap<SeriesId, BTreeMap<SealedChunkKey, Chunk>>>; IN_MEMORY_SHARD_COUNT],
-    persisted_chunk_refs: RwLock<HashMap<SeriesId, Vec<PersistedChunkRef>>>,
-    persisted_segment_maps: RwLock<Vec<Arc<PlatformMmap>>>,
+    persisted_index: RwLock<PersistedIndexState>,
     persisted_chunk_watermarks: RwLock<HashMap<SeriesId, u64>>,
     next_chunk_sequence: AtomicU64,
     chunk_point_cap: usize,
@@ -246,6 +251,7 @@ pub struct ChunkStorage {
     max_observed_timestamp: AtomicI64,
     lifecycle: Arc<AtomicU8>,
     compaction_lock: Arc<Mutex<()>>,
+    flush_visibility_lock: RwLock<()>,
     compaction_thread: Option<std::thread::Thread>,
     flush_thread: Mutex<Option<std::thread::Thread>>,
 }
@@ -317,8 +323,7 @@ impl ChunkStorage {
             registry_write_txn_shards: std::array::from_fn(|_| Mutex::new(())),
             active_builders: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             sealed_chunks: std::array::from_fn(|_| RwLock::new(HashMap::new())),
-            persisted_chunk_refs: RwLock::new(HashMap::new()),
-            persisted_segment_maps: RwLock::new(Vec::new()),
+            persisted_index: RwLock::new(PersistedIndexState::default()),
             persisted_chunk_watermarks: RwLock::new(HashMap::new()),
             next_chunk_sequence: AtomicU64::new(1),
             chunk_point_cap: chunk_point_cap.clamp(1, u16::MAX as usize),
@@ -339,6 +344,7 @@ impl ChunkStorage {
             max_observed_timestamp: AtomicI64::new(i64::MIN),
             lifecycle,
             compaction_lock,
+            flush_visibility_lock: RwLock::new(()),
             compaction_thread,
             flush_thread: Mutex::new(None),
         }
@@ -481,7 +487,11 @@ impl ChunkStorage {
             write_permits.push(permit);
         }
         self.flush_all_active()?;
-        self.persist_segment(true)?;
+        let persisted = self.persist_segment(true)?;
+        drop(write_permits);
+        if persisted {
+            self.refresh_persisted_indexes_and_evict_flushed_sealed_chunks()?;
+        }
         if self.memory_budget_value() != usize::MAX {
             self.refresh_memory_usage();
         }
@@ -636,16 +646,15 @@ impl ChunkStorage {
         }
     }
 
-    fn refresh_persisted_chunk_watermarks_from_sealed(&self) {
+    fn mark_persisted_chunk_watermarks(&self, watermarks: &HashMap<SeriesId, u64>) {
+        if watermarks.is_empty() {
+            return;
+        }
+
         let mut persisted = self.persisted_chunk_watermarks.write();
-        persisted.clear();
-        for shard in &self.sealed_chunks {
-            let sealed = shard.read();
-            for (series_id, chunks) in sealed.iter() {
-                if let Some(watermark) = chunks.keys().map(|key| key.sequence).max() {
-                    persisted.insert(*series_id, watermark);
-                }
-            }
+        for (series_id, watermark) in watermarks {
+            let entry = persisted.entry(*series_id).or_insert(0);
+            *entry = (*entry).max(*watermark);
         }
     }
 
@@ -668,6 +677,35 @@ impl ChunkStorage {
         self.apply_loaded_segment_indexes(loaded_segments)
     }
 
+    fn refresh_persisted_indexes_and_evict_flushed_sealed_chunks(&self) -> Result<()> {
+        let _visibility_guard = self.flush_visibility_lock.write();
+        self.reload_persisted_indexes_from_disk()?;
+        self.evict_persisted_sealed_chunks();
+        Ok(())
+    }
+
+    fn sealed_chunk_is_present_in_persisted_index(
+        &self,
+        series_id: SeriesId,
+        key: SealedChunkKey,
+        chunk: &Chunk,
+    ) -> bool {
+        self.persisted_index
+            .read()
+            .chunk_refs
+            .get(&series_id)
+            .is_some_and(|persisted_chunks| {
+                persisted_chunks.iter().any(|chunk_ref| {
+                    chunk_ref.min_ts == key.min_ts
+                        && chunk_ref.max_ts == key.max_ts
+                        && chunk_ref.point_count == key.point_count
+                        && chunk_ref.lane == chunk.header.lane
+                        && chunk_ref.ts_codec == chunk.header.ts_codec
+                        && chunk_ref.value_codec == chunk.header.value_codec
+                })
+            })
+    }
+
     fn find_oldest_evictable_sealed_chunk(&self) -> Option<(usize, SeriesId, SealedChunkKey)> {
         let persisted = self.persisted_chunk_watermarks.read();
         let mut oldest: Option<(usize, SeriesId, SealedChunkKey)> = None;
@@ -676,8 +714,11 @@ impl ChunkStorage {
             let sealed = shard.read();
             for (series_id, chunks) in sealed.iter() {
                 let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
-                for key in chunks.keys() {
+                for (key, chunk) in chunks {
                     if key.sequence > persisted_sequence {
+                        continue;
+                    }
+                    if !self.sealed_chunk_is_present_in_persisted_index(*series_id, *key, chunk) {
                         continue;
                     }
                     let replace = oldest
@@ -710,6 +751,14 @@ impl ChunkStorage {
         removed
     }
 
+    fn evict_persisted_sealed_chunks(&self) -> usize {
+        let mut evicted = 0usize;
+        while self.evict_oldest_persisted_sealed_chunk() {
+            evicted = evicted.saturating_add(1);
+        }
+        evicted
+    }
+
     fn enforce_memory_budget_if_needed(&self) -> Result<()> {
         let budget = self.memory_budget_value();
         if budget == usize::MAX || self.memory_used_value() <= budget {
@@ -734,8 +783,10 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        self.persist_segment(false)?;
-        self.reload_persisted_indexes_from_disk()?;
+        if self.persist_segment(false)? {
+            self.refresh_persisted_indexes_and_evict_flushed_sealed_chunks()?;
+            used = self.refresh_memory_usage();
+        }
 
         while used > budget {
             if !self.evict_oldest_persisted_sealed_chunk() {
@@ -778,6 +829,7 @@ impl ChunkStorage {
         end: i64,
         out: &mut Vec<DataPoint>,
     ) -> Result<()> {
+        let _visibility_guard = self.flush_visibility_lock.read();
         out.clear();
         let mut has_overlap = false;
         let mut has_previous_chunk = false;
@@ -789,10 +841,9 @@ impl ChunkStorage {
         let mut requires_exact_dedupe = false;
 
         {
-            let persisted_chunk_refs = self.persisted_chunk_refs.read();
-            let persisted_segment_maps = self.persisted_segment_maps.read();
+            let persisted_index = self.persisted_index.read();
 
-            if let Some(chunks) = persisted_chunk_refs.get(&series_id) {
+            if let Some(chunks) = persisted_index.chunk_refs.get(&series_id) {
                 let end_idx = chunks.partition_point(|chunk| chunk.min_ts < end);
                 for chunk_ref in &chunks[..end_idx] {
                     if chunk_ref.max_ts < start {
@@ -813,7 +864,10 @@ impl ChunkStorage {
                     previous_max_ts = previous_max_ts.max(chunk_ref.max_ts);
                     previous_persisted_max_ts = previous_persisted_max_ts.max(chunk_ref.max_ts);
 
-                    let payload = persisted_chunk_payload(&persisted_segment_maps, chunk_ref)?;
+                    let payload = persisted_chunk_payload(
+                        persisted_index.segment_maps.as_slice(),
+                        chunk_ref,
+                    )?;
                     decode_encoded_chunk_payload_in_range_into(
                         EncodedChunkDescriptor {
                             lane: chunk_ref.lane,
@@ -975,8 +1029,9 @@ impl ChunkStorage {
         }
 
         if let Some(persisted_lane) = self
-            .persisted_chunk_refs
+            .persisted_index
             .read()
+            .chunk_refs
             .get(&series_id)
             .and_then(|chunks| chunks.last())
             .map(|chunk_ref| chunk_ref.lane)
@@ -1315,14 +1370,10 @@ impl ChunkStorage {
         }
 
         {
-            let mut refs = self.persisted_chunk_refs.write();
-            *refs = persisted_refs;
+            let mut persisted_index = self.persisted_index.write();
+            persisted_index.chunk_refs = persisted_refs;
+            persisted_index.segment_maps = persisted_maps;
         }
-        {
-            let mut maps = self.persisted_segment_maps.write();
-            *maps = persisted_maps;
-        }
-        self.refresh_persisted_chunk_watermarks_from_sealed();
 
         if loaded_max_timestamp != i64::MIN {
             self.update_max_observed_timestamp(loaded_max_timestamp);
@@ -1333,9 +1384,9 @@ impl ChunkStorage {
         Ok(())
     }
 
-    fn persist_segment(&self, include_wal_highwater: bool) -> Result<()> {
+    fn persist_segment(&self, include_wal_highwater: bool) -> Result<bool> {
         if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
-            return Ok(());
+            return Ok(false);
         }
 
         let wal_highwater = if include_wal_highwater {
@@ -1347,49 +1398,73 @@ impl ChunkStorage {
             WalHighWatermark::default()
         };
 
-        let delta_chunks = {
+        let (delta_chunks, delta_watermarks) = {
             let persisted = self.persisted_chunk_watermarks.read();
 
             let mut delta = HashMap::new();
+            let mut watermarks = HashMap::new();
             for shard in &self.sealed_chunks {
                 let sealed = shard.read();
                 for (series_id, chunks) in sealed.iter() {
                     let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
-                    let updates = chunks
-                        .iter()
-                        .filter(|(key, _)| key.sequence > persisted_sequence)
-                        .map(|(_, chunk)| chunk.clone())
-                        .collect::<Vec<_>>();
+                    let mut updates = Vec::new();
+                    let mut max_sequence = persisted_sequence;
+                    for (key, chunk) in chunks {
+                        if key.sequence <= persisted_sequence {
+                            continue;
+                        }
+                        max_sequence = max_sequence.max(key.sequence);
+                        updates.push(chunk.clone());
+                    }
                     if !updates.is_empty() {
                         delta.insert(*series_id, updates);
+                        watermarks.insert(*series_id, max_sequence);
                     }
                 }
             }
-            delta
+            (delta, watermarks)
         };
 
         if delta_chunks.is_empty() {
             if let Some(wal) = &self.wal {
                 wal.reset()?;
             }
-            return Ok(());
+            return Ok(false);
         }
 
         let mut numeric_chunks = HashMap::new();
         let mut blob_chunks = HashMap::new();
+        let mut numeric_watermarks = HashMap::new();
+        let mut blob_watermarks = HashMap::new();
         for (series_id, chunks) in &delta_chunks {
             let Some(first) = chunks.first() else {
+                continue;
+            };
+            let Some(watermark) = delta_watermarks.get(series_id).copied() else {
                 continue;
             };
 
             match first.header.lane {
                 ValueLane::Numeric => {
                     numeric_chunks.insert(*series_id, chunks.clone());
+                    numeric_watermarks.insert(*series_id, watermark);
                 }
                 ValueLane::Blob => {
                     blob_chunks.insert(*series_id, chunks.clone());
+                    blob_watermarks.insert(*series_id, watermark);
                 }
             }
+        }
+
+        if !numeric_chunks.is_empty() && self.numeric_lane_path.is_none() {
+            return Err(TsinkError::InvalidConfiguration(
+                "cannot persist numeric chunks without numeric lane path".to_string(),
+            ));
+        }
+        if !blob_chunks.is_empty() && self.blob_lane_path.is_none() {
+            return Err(TsinkError::InvalidConfiguration(
+                "cannot persist blob chunks without blob lane path".to_string(),
+            ));
         }
 
         {
@@ -1412,13 +1487,15 @@ impl ChunkStorage {
             }
         }
 
-        self.refresh_persisted_chunk_watermarks_from_sealed();
+        let mut flushed_watermarks = numeric_watermarks;
+        flushed_watermarks.extend(blob_watermarks);
+        self.mark_persisted_chunk_watermarks(&flushed_watermarks);
 
         if let Some(wal) = &self.wal {
             wal.reset()?;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn compact_compactors(
@@ -3118,7 +3195,7 @@ mod tests {
     }
 
     #[test]
-    fn background_flush_pipeline_persists_head_and_sealed_chunks_while_open() {
+    fn background_flush_pipeline_refreshes_persisted_index_and_evicts_sealed_chunks_while_open() {
         use std::sync::Arc;
         use std::thread;
         use std::time::Instant;
@@ -3164,9 +3241,15 @@ mod tests {
                 .read()
                 .get(&series_id)
                 .map_or(0, |chunks| chunks.len());
+            let persisted_len = storage
+                .persisted_index
+                .read()
+                .chunk_refs
+                .get(&series_id)
+                .map_or(0, |chunks| chunks.len());
             let l0 = load_segments_for_level(&lane_path, 0).unwrap();
 
-            if active_len == 0 && sealed_len >= 2 && !l0.is_empty() {
+            if active_len == 0 && sealed_len == 0 && persisted_len >= 2 && !l0.is_empty() {
                 flushed = true;
                 break;
             }
@@ -3176,7 +3259,7 @@ mod tests {
 
         assert!(
             flushed,
-            "background flush pipeline did not flush partial head + sealed chunks"
+            "background flush pipeline did not refresh persisted indexes and evict flushed sealed chunks"
         );
         assert_eq!(
             storage

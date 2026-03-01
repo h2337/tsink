@@ -280,6 +280,13 @@ pub fn load_segments(base: impl AsRef<Path>) -> Result<LoadedSegments> {
                 max_segment_id = max_segment_id.max(segment.manifest.segment_id);
                 parsed.push(segment);
             }
+            Err(err) if is_not_found_error(&err) => {
+                warn!(
+                    path = %dir.display(),
+                    error = %err,
+                    "Segment directory disappeared during scan; skipping"
+                );
+            }
             Err(TsinkError::DataCorruption(msg)) => {
                 warn!(path = %dir.display(), error = %msg, "Ignoring invalid segment directory");
             }
@@ -348,6 +355,13 @@ pub fn load_segment_indexes(base: impl AsRef<Path>) -> Result<LoadedSegmentIndex
                 max_wal_highwater = max_wal_highwater.max(segment.manifest.wal_highwater);
                 parsed.push(segment);
             }
+            Err(err) if is_not_found_error(&err) => {
+                warn!(
+                    path = %dir.display(),
+                    error = %err,
+                    "Segment directory disappeared during indexed scan; skipping"
+                );
+            }
             Err(TsinkError::DataCorruption(msg)) => {
                 warn!(path = %dir.display(), error = %msg, "Ignoring invalid segment directory");
             }
@@ -405,6 +419,13 @@ pub fn load_segments_for_level(base: impl AsRef<Path>, level: u8) -> Result<Vec<
                 series: segment.series,
                 chunks_by_series: segment.chunks_by_series,
             }),
+            Err(err) if is_not_found_error(&err) => {
+                warn!(
+                    path = %dir.display(),
+                    error = %err,
+                    "Segment directory disappeared while loading level; skipping"
+                );
+            }
             Err(TsinkError::DataCorruption(msg)) => {
                 warn!(
                     path = %dir.display(),
@@ -429,8 +450,19 @@ fn collect_segment_dirs(base: &Path, levels: impl IntoIterator<Item = u8>) -> Re
         };
 
         for entry in read_dir {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+
+            if !file_type.is_dir() {
                 continue;
             }
 
@@ -448,6 +480,10 @@ fn collect_segment_dirs(base: &Path, levels: impl IntoIterator<Item = u8>) -> Re
     }
 
     Ok(dirs)
+}
+
+fn is_not_found_error(err: &TsinkError) -> bool {
+    matches!(err, TsinkError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
 }
 
 #[derive(Debug)]

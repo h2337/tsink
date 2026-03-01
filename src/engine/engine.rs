@@ -239,6 +239,7 @@ const WAL_DIR_NAME: &str = "wal";
 
 pub struct ChunkStorage {
     registry: RwLock<SeriesRegistry>,
+    materialized_series: RwLock<BTreeSet<SeriesId>>,
     registry_write_txn_shards: [Mutex<()>; REGISTRY_TXN_SHARD_COUNT],
     active_builders: [RwLock<HashMap<SeriesId, ActiveSeriesState>>; IN_MEMORY_SHARD_COUNT],
     sealed_chunks:
@@ -341,6 +342,7 @@ impl ChunkStorage {
 
         Self {
             registry: RwLock::new(SeriesRegistry::new()),
+            materialized_series: RwLock::new(BTreeSet::new()),
             registry_write_txn_shards: std::array::from_fn(|_| Mutex::new(())),
             active_builders: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             sealed_chunks: std::array::from_fn(|_| RwLock::new(HashMap::new())),
@@ -407,6 +409,31 @@ impl ChunkStorage {
         series_id: SeriesId,
     ) -> &RwLock<HashMap<SeriesId, BTreeMap<SealedChunkKey, Chunk>>> {
         &self.sealed_chunks[Self::series_shard_idx(series_id)]
+    }
+
+    fn mark_materialized_series_ids<I>(&self, series_ids: I)
+    where
+        I: IntoIterator<Item = SeriesId>,
+    {
+        self.materialized_series.write().extend(series_ids);
+    }
+
+    fn metric_series_for_ids<I>(&self, series_ids: I) -> Vec<MetricSeries>
+    where
+        I: IntoIterator<Item = SeriesId>,
+    {
+        let registry = self.registry.read();
+        series_ids
+            .into_iter()
+            .filter_map(|series_id| {
+                registry
+                    .decode_series_key(series_id)
+                    .map(|series_key| MetricSeries {
+                        name: series_key.metric,
+                        labels: series_key.labels,
+                    })
+            })
+            .collect()
     }
 
     fn spawn_background_compaction_thread(
@@ -1890,6 +1917,7 @@ impl ChunkStorage {
             self.append_sealed_chunk(series_id, chunk);
         }
         self.update_max_observed_timestamp(ts);
+        self.mark_materialized_series_ids(std::iter::once(series_id));
 
         Ok(())
     }
@@ -1926,6 +1954,7 @@ impl ChunkStorage {
         }
 
         let mut finalized = Vec::<(SeriesId, Chunk)>::new();
+        let mut materialized_series_ids = BTreeSet::new();
         {
             let mut active = self.active_builders[shard_idx].write();
 
@@ -1940,6 +1969,7 @@ impl ChunkStorage {
                         actual: lane_name(point.lane).to_string(),
                     });
                 }
+                materialized_series_ids.insert(point.series_id);
 
                 if let Some(chunk) =
                     state.rotate_partition_if_needed(point.ts, self.partition_window)?
@@ -1955,6 +1985,8 @@ impl ChunkStorage {
                 }
             }
         }
+
+        self.mark_materialized_series_ids(materialized_series_ids);
 
         if finalized.is_empty() {
             return Ok(());
@@ -2152,6 +2184,8 @@ impl ChunkStorage {
                 )
             });
         }
+
+        self.mark_materialized_series_ids(persisted_refs.keys().copied());
 
         {
             let mut persisted_index = self.persisted_index.write();
@@ -2623,19 +2657,19 @@ impl Storage for ChunkStorage {
 
     fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
         self.ensure_open()?;
+        let materialized_series_ids = self
+            .materialized_series
+            .read()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        Ok(self.metric_series_for_ids(materialized_series_ids))
+    }
 
-        let registry = self.registry.read();
-        let mut metrics = Vec::new();
-        for series_id in registry.all_series_ids() {
-            if let Some(series_key) = registry.decode_series_key(series_id) {
-                metrics.push(MetricSeries {
-                    name: series_key.metric,
-                    labels: series_key.labels,
-                });
-            }
-        }
-
-        Ok(metrics)
+    fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
+        self.ensure_open()?;
+        let all_series_ids = self.registry.read().all_series_ids();
+        Ok(self.metric_series_for_ids(all_series_ids))
     }
 
     fn select_series(&self, selection: &SeriesSelection) -> Result<Vec<MetricSeries>> {
@@ -4057,12 +4091,19 @@ mod tests {
                 .build()
                 .unwrap();
 
-            let has_phantom = storage
+            let has_phantom_without_wal = storage
                 .list_metrics()
                 .unwrap()
                 .into_iter()
                 .any(|series| series.name == metric && series.labels == labels);
-            assert!(has_phantom);
+            assert!(!has_phantom_without_wal);
+
+            let has_phantom_with_wal = storage
+                .list_metrics_with_wal()
+                .unwrap()
+                .into_iter()
+                .any(|series| series.name == metric && series.labels == labels);
+            assert!(has_phantom_with_wal);
 
             storage.close().unwrap();
         }
@@ -4076,6 +4117,13 @@ mod tests {
 
         let has_phantom = reopened
             .list_metrics()
+            .unwrap()
+            .into_iter()
+            .any(|series| series.name == metric && series.labels == labels);
+        assert!(!has_phantom);
+
+        let has_phantom = reopened
+            .list_metrics_with_wal()
             .unwrap()
             .into_iter()
             .any(|series| series.name == metric && series.labels == labels);

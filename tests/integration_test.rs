@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+use tsink::engine::wal::{FramedWal, SeriesDefinitionFrame};
 use tsink::{
     DataPoint, Label, MetricSeries, QueryOptions, Row, StorageBuilder, TimestampPrecision,
     TsinkError, WalSyncMode,
@@ -440,6 +441,18 @@ fn test_list_metrics_deduplicates_across_disk_memory_and_wal() {
 #[test]
 fn test_list_metrics_ignores_runtime_wal_only_series() {
     let temp_dir = TempDir::new().unwrap();
+    let wal_only_metric = "wal_only_metric";
+    let wal_only_labels = vec![Label::new("source", "wal")];
+
+    {
+        let wal = FramedWal::open(temp_dir.path().join("wal"), WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 4242,
+            metric: wal_only_metric.to_string(),
+            labels: wal_only_labels.clone(),
+        })
+        .unwrap();
+    }
 
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
@@ -449,16 +462,8 @@ fn test_list_metrics_ignores_runtime_wal_only_series() {
         .build()
         .unwrap();
 
-    storage
-        .insert_rows(&[Row::new("from_partition", DataPoint::new(10, 1.0))])
-        .unwrap();
-
     let metrics = storage.list_metrics().unwrap();
-    let expected = vec![MetricSeries {
-        name: "from_partition".to_string(),
-        labels: Vec::new(),
-    }];
-    assert_eq!(metrics, expected);
+    assert!(metrics.is_empty());
 
     storage.close().unwrap();
 }
@@ -466,6 +471,18 @@ fn test_list_metrics_ignores_runtime_wal_only_series() {
 #[test]
 fn test_list_metrics_with_wal_includes_runtime_wal_only_series() {
     let temp_dir = TempDir::new().unwrap();
+    let wal_only_metric = "wal_only_metric";
+    let wal_only_labels = vec![Label::new("source", "wal")];
+
+    {
+        let wal = FramedWal::open(temp_dir.path().join("wal"), WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 4242,
+            metric: wal_only_metric.to_string(),
+            labels: wal_only_labels.clone(),
+        })
+        .unwrap();
+    }
 
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
@@ -475,14 +492,10 @@ fn test_list_metrics_with_wal_includes_runtime_wal_only_series() {
         .build()
         .unwrap();
 
-    storage
-        .insert_rows(&[Row::new("from_partition", DataPoint::new(10, 1.0))])
-        .unwrap();
-
     let metrics = storage.list_metrics_with_wal().unwrap();
     let expected = vec![MetricSeries {
-        name: "from_partition".to_string(),
-        labels: Vec::new(),
+        name: wal_only_metric.to_string(),
+        labels: wal_only_labels,
     }];
     assert_eq!(metrics, expected);
 

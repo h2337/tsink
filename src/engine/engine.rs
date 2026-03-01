@@ -2299,6 +2299,7 @@ impl Storage for ChunkStorage {
             }
         }
 
+        let mut ingest_committed = false;
         let write_result = (|| -> Result<()> {
             for point in &pending_points {
                 self.validate_series_lane_compatible(point.series_id, point.lane)?;
@@ -2320,6 +2321,8 @@ impl Storage for ChunkStorage {
             )?;
             self.enforce_admission_controls(estimated_memory_growth, estimated_wal_growth)?;
             reserved_series = self.reserve_series_lanes(&pending_points)?;
+            self.ingest_pending_points(std::mem::take(&mut pending_points))?;
+            ingest_committed = true;
 
             if let (Some(wal), Some(batches)) = (&self.wal, wal_batches.as_deref()) {
                 for definition in &new_series_defs {
@@ -2328,14 +2331,17 @@ impl Storage for ChunkStorage {
 
                 wal.append_samples(batches)?;
             }
-
-            self.ingest_pending_points(std::mem::take(&mut pending_points))
+            Ok(())
         })();
 
         if let Err(err) = write_result {
-            self.rollback_empty_series_lane_reservations(&reserved_series);
-            let mut registry = self.registry.write();
-            registry.rollback_created_series(&created_series);
+            if !ingest_committed {
+                self.rollback_empty_series_lane_reservations(&reserved_series);
+                let mut registry = self.registry.write();
+                registry.rollback_created_series(&created_series);
+            } else {
+                self.notify_flush_thread();
+            }
             if self.memory_budget_value() != usize::MAX {
                 self.refresh_memory_usage();
             }
@@ -3533,6 +3539,74 @@ mod tests {
         assert!(!has_mixed_metric);
 
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn failed_ingest_does_not_append_wal_samples() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal =
+            FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+        let storage = ChunkStorage::new(2, Some(wal));
+        let labels = vec![Label::new("host", "a")];
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                "wal_ingest_guard",
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let sample_batches_before: usize = storage
+            .wal
+            .as_ref()
+            .unwrap()
+            .replay_frames()
+            .unwrap()
+            .into_iter()
+            .map(|frame| match frame {
+                ReplayFrame::Samples(batches) => batches.len(),
+                ReplayFrame::SeriesDefinition(_) => 0,
+            })
+            .sum();
+
+        let series_id = storage
+            .registry
+            .read()
+            .resolve_existing("wal_ingest_guard", &labels)
+            .unwrap()
+            .series_id;
+        {
+            let mut active = storage.active_shard(series_id).write();
+            active
+                .get_mut(&series_id)
+                .unwrap()
+                .builder
+                .append(2, Value::I64(2));
+        }
+
+        let err = storage
+            .insert_rows(&[Row::with_labels(
+                "wal_ingest_guard",
+                labels.clone(),
+                DataPoint::new(3, 3.0),
+            )])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+
+        let sample_batches_after: usize = storage
+            .wal
+            .as_ref()
+            .unwrap()
+            .replay_frames()
+            .unwrap()
+            .into_iter()
+            .map(|frame| match frame {
+                ReplayFrame::Samples(batches) => batches.len(),
+                ReplayFrame::SeriesDefinition(_) => 0,
+            })
+            .sum();
+        assert_eq!(sample_batches_after, sample_batches_before);
     }
 
     #[test]

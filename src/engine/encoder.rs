@@ -163,10 +163,11 @@ fn choose_best_timestamp_codec(points: &[ChunkPoint]) -> Result<(TimestampCodecI
         candidates.push((TimestampCodecId::FixedStepRle, payload));
     }
 
-    candidates.push((
-        TimestampCodecId::DeltaOfDeltaBitpack,
-        encode_timestamps_delta_of_delta(points)?,
-    ));
+    // Delta-of-delta can overflow when successive deltas swing across i64 extremes.
+    // Keep evaluating other codecs instead of aborting selection immediately.
+    if let Ok(payload) = encode_timestamps_delta_of_delta(points) {
+        candidates.push((TimestampCodecId::DeltaOfDeltaBitpack, payload));
+    }
     candidates.push((
         TimestampCodecId::DeltaVarint,
         encode_timestamps_delta_varint(points)?,
@@ -1180,6 +1181,21 @@ mod tests {
 
         let err = Encoder::encode(&points).unwrap_err();
         assert!(matches!(err, TsinkError::Codec(_)));
+    }
+
+    #[test]
+    fn falls_back_to_delta_varint_when_delta_of_delta_overflows() {
+        let points = vec![
+            DataPoint::new(0, Value::I64(1)),
+            DataPoint::new(i64::MAX, Value::I64(2)),
+            DataPoint::new(-1, Value::I64(3)),
+        ];
+
+        let encoded = Encoder::encode(&points).unwrap();
+        assert_eq!(encoded.ts_codec, TimestampCodecId::DeltaVarint);
+
+        let decoded = Encoder::decode(&encoded).unwrap();
+        assert_eq!(decoded, points);
     }
 
     #[test]

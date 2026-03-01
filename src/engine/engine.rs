@@ -37,6 +37,7 @@ const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 3600);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
 const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const IN_MEMORY_SHARD_COUNT: usize = 64;
 const REGISTRY_TXN_SHARD_COUNT: usize = IN_MEMORY_SHARD_COUNT;
 
@@ -246,6 +247,7 @@ pub struct ChunkStorage {
     lifecycle: Arc<AtomicU8>,
     compaction_lock: Arc<Mutex<()>>,
     compaction_thread: Option<std::thread::Thread>,
+    flush_thread: Mutex<Option<std::thread::Thread>>,
 }
 
 impl ChunkStorage {
@@ -338,6 +340,7 @@ impl ChunkStorage {
             lifecycle,
             compaction_lock,
             compaction_thread,
+            flush_thread: Mutex::new(None),
         }
     }
 
@@ -416,6 +419,73 @@ impl ChunkStorage {
         if let Some(compaction_thread) = &self.compaction_thread {
             compaction_thread.unpark();
         }
+    }
+
+    fn spawn_background_flush_thread(
+        storage: std::sync::Weak<Self>,
+        flush_interval: Duration,
+    ) -> Option<std::thread::Thread> {
+        let handle = std::thread::Builder::new()
+            .name("tsink-flush".to_string())
+            .spawn(move || loop {
+                std::thread::park_timeout(flush_interval);
+
+                let Some(storage) = storage.upgrade() else {
+                    break;
+                };
+
+                match storage.lifecycle.load(Ordering::SeqCst) {
+                    STORAGE_OPEN => {}
+                    STORAGE_CLOSED => break,
+                    _ => continue,
+                }
+
+                let _ = storage.flush_pipeline_once();
+            })
+            .ok()?;
+
+        let thread = handle.thread().clone();
+        drop(handle);
+        Some(thread)
+    }
+
+    fn start_background_flush_thread(self: &Arc<Self>, flush_interval: Duration) {
+        if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
+            return;
+        }
+
+        let mut flush_thread = self.flush_thread.lock();
+        if flush_thread.is_some() {
+            return;
+        }
+
+        *flush_thread = Self::spawn_background_flush_thread(Arc::downgrade(self), flush_interval);
+    }
+
+    fn notify_flush_thread(&self) {
+        if let Some(flush_thread) = self.flush_thread.lock().as_ref() {
+            flush_thread.unpark();
+        }
+    }
+
+    fn flush_pipeline_once(&self) -> Result<()> {
+        if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
+            return Ok(());
+        }
+
+        let mut write_permits = Vec::with_capacity(self.write_limiter.capacity());
+        for _ in 0..self.write_limiter.capacity() {
+            let Some(permit) = self.write_limiter.try_acquire() else {
+                return Ok(());
+            };
+            write_permits.push(permit);
+        }
+        self.flush_all_active()?;
+        self.persist_segment()?;
+        if self.memory_budget_value() != usize::MAX {
+            self.refresh_memory_usage();
+        }
+        Ok(())
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -685,25 +755,17 @@ impl ChunkStorage {
     }
 
     fn flush_all_active(&self) -> Result<()> {
-        let mut finalized = Vec::new();
-
-        {
-            for shard in &self.active_builders {
-                let mut active = shard.write();
-                for (series_id, state) in active.iter_mut() {
-                    if let Some(chunk) = state.flush_partial()? {
-                        finalized.push((*series_id, chunk));
-                    }
-                }
+        for shard in &self.active_builders {
+            let mut active = shard.write();
+            for (series_id, state) in active.iter_mut() {
+                let Some(chunk) = state.flush_partial()? else {
+                    continue;
+                };
+                let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
+                let key = SealedChunkKey::from_chunk(&chunk, sequence);
+                let mut sealed = self.sealed_shard(*series_id).write();
+                sealed.entry(*series_id).or_default().insert(key, chunk);
             }
-        }
-
-        if finalized.is_empty() {
-            return Ok(());
-        }
-
-        for (series_id, chunk) in finalized {
-            self.append_sealed_chunk(series_id, chunk);
         }
 
         Ok(())
@@ -768,6 +830,9 @@ impl ChunkStorage {
             }
         }
 
+        // Hold active read lock while reading sealed+active to prevent observing a transient
+        // "moved out of active but not yet visible in sealed" flush transition.
+        let active = self.active_shard(series_id).read();
         {
             let sealed = self.sealed_shard(series_id).read();
             if let Some(chunks) = sealed.get(&series_id) {
@@ -799,31 +864,28 @@ impl ChunkStorage {
             }
         }
 
-        {
-            let active = self.active_shard(series_id).read();
-            if let Some(state) = active.get(&series_id) {
-                let mut previous_active_ts = i64::MIN;
-                let mut has_previous_active = false;
+        if let Some(state) = active.get(&series_id) {
+            let mut previous_active_ts = i64::MIN;
+            let mut has_previous_active = false;
 
-                for point in state.builder.points() {
-                    if point.ts < start || point.ts >= end {
-                        continue;
-                    }
-
-                    if has_previous_chunk && point.ts <= previous_max_ts {
-                        has_overlap = true;
-                    }
-                    if has_previous_persisted_chunk && point.ts <= previous_persisted_max_ts {
-                        requires_exact_dedupe = true;
-                    }
-                    if has_previous_active && point.ts < previous_active_ts {
-                        requires_output_validation = true;
-                    }
-
-                    has_previous_active = true;
-                    previous_active_ts = point.ts;
-                    out.push(DataPoint::new(point.ts, point.value.clone()));
+            for point in state.builder.points() {
+                if point.ts < start || point.ts >= end {
+                    continue;
                 }
+
+                if has_previous_chunk && point.ts <= previous_max_ts {
+                    has_overlap = true;
+                }
+                if has_previous_persisted_chunk && point.ts <= previous_persisted_max_ts {
+                    requires_exact_dedupe = true;
+                }
+                if has_previous_active && point.ts < previous_active_ts {
+                    requires_output_validation = true;
+                }
+
+                has_previous_active = true;
+                previous_active_ts = point.ts;
+                out.push(DataPoint::new(point.ts, point.value.clone()));
             }
         }
 
@@ -1453,6 +1515,7 @@ impl Storage for ChunkStorage {
             self.enforce_memory_budget_if_needed()?;
         }
 
+        self.notify_flush_thread();
         Ok(())
     }
 
@@ -1650,6 +1713,7 @@ impl Storage for ChunkStorage {
         }
 
         self.notify_compaction_thread();
+        self.notify_flush_thread();
 
         let close_result = (|| {
             let _write_permits = self.write_limiter.acquire_all(self.write_timeout)?;
@@ -1667,6 +1731,7 @@ impl Storage for ChunkStorage {
             self.lifecycle.store(STORAGE_OPEN, Ordering::SeqCst);
         }
         self.notify_compaction_thread();
+        self.notify_flush_thread();
 
         close_result
     }
@@ -1682,6 +1747,7 @@ impl Drop for ChunkStorage {
         let _ = <Self as Storage>::close(self);
         self.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
         self.notify_compaction_thread();
+        self.notify_flush_thread();
     }
 }
 
@@ -1754,6 +1820,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         storage.refresh_memory_usage();
         storage.enforce_memory_budget_if_needed()?;
     }
+    storage.start_background_flush_thread(DEFAULT_FLUSH_INTERVAL);
 
     Ok(storage as Arc<dyn Storage>)
 }
@@ -3020,6 +3087,78 @@ mod tests {
         }
 
         assert!(compacted, "background thread did not compact L0 into L1");
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn background_flush_pipeline_persists_head_and_sealed_chunks_while_open() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Instant;
+
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let labels = vec![Label::new("host", "a")];
+        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
+            2,
+            None,
+            Some(lane_path.clone()),
+            None,
+            1,
+            ChunkStorageOptions::default(),
+        ));
+        storage.start_background_flush_thread(Duration::from_millis(25));
+
+        storage
+            .insert_rows(&[
+                Row::with_labels("background_flush", labels.clone(), DataPoint::new(1, 1.0)),
+                Row::with_labels("background_flush", labels.clone(), DataPoint::new(2, 2.0)),
+                Row::with_labels("background_flush", labels.clone(), DataPoint::new(3, 3.0)),
+            ])
+            .unwrap();
+
+        let series_id = storage
+            .registry
+            .read()
+            .resolve_existing("background_flush", &labels)
+            .unwrap()
+            .series_id;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut flushed = false;
+        while Instant::now() < deadline {
+            let active_len = storage
+                .active_shard(series_id)
+                .read()
+                .get(&series_id)
+                .map_or(0, |state| state.builder.len());
+            let sealed_len = storage
+                .sealed_shard(series_id)
+                .read()
+                .get(&series_id)
+                .map_or(0, |chunks| chunks.len());
+            let l0 = load_segments_for_level(&lane_path, 0).unwrap();
+
+            if active_len == 0 && sealed_len >= 2 && !l0.is_empty() {
+                flushed = true;
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(
+            flushed,
+            "background flush pipeline did not flush partial head + sealed chunks"
+        );
+        assert_eq!(
+            storage
+                .select("background_flush", &labels, 0, 10)
+                .unwrap()
+                .len(),
+            3
+        );
+
         storage.close().unwrap();
     }
 

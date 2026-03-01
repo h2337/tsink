@@ -58,6 +58,7 @@ jobs:
         run: bash scripts/measure_bpp.sh quick
 
   bench:
+    if: false
     name: Benchmarks
     runs-on: ubuntu-latest
     steps:

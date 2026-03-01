@@ -35,6 +35,7 @@ const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 3600);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
 const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
+const IN_MEMORY_SHARD_COUNT: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 struct ChunkStorageOptions {
@@ -214,8 +215,9 @@ const WAL_DIR_NAME: &str = "wal";
 pub struct ChunkStorage {
     registry: RwLock<SeriesRegistry>,
     registry_write_txn: Mutex<()>,
-    active_builders: RwLock<HashMap<SeriesId, ActiveSeriesState>>,
-    sealed_chunks: RwLock<HashMap<SeriesId, BTreeMap<SealedChunkKey, Chunk>>>,
+    active_builders: [RwLock<HashMap<SeriesId, ActiveSeriesState>>; IN_MEMORY_SHARD_COUNT],
+    sealed_chunks:
+        [RwLock<HashMap<SeriesId, BTreeMap<SealedChunkKey, Chunk>>>; IN_MEMORY_SHARD_COUNT],
     persisted_chunk_refs: RwLock<HashMap<SeriesId, Vec<PersistedChunkRef>>>,
     persisted_segment_maps: RwLock<Vec<Arc<PlatformMmap>>>,
     persisted_chunk_watermarks: RwLock<HashMap<SeriesId, u64>>,
@@ -303,8 +305,8 @@ impl ChunkStorage {
         Self {
             registry: RwLock::new(SeriesRegistry::new()),
             registry_write_txn: Mutex::new(()),
-            active_builders: RwLock::new(HashMap::new()),
-            sealed_chunks: RwLock::new(HashMap::new()),
+            active_builders: std::array::from_fn(|_| RwLock::new(HashMap::new())),
+            sealed_chunks: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             persisted_chunk_refs: RwLock::new(HashMap::new()),
             persisted_segment_maps: RwLock::new(Vec::new()),
             persisted_chunk_watermarks: RwLock::new(HashMap::new()),
@@ -326,6 +328,21 @@ impl ChunkStorage {
             compaction_lock,
             compaction_thread,
         }
+    }
+
+    fn series_shard_idx(series_id: SeriesId) -> usize {
+        (series_id % IN_MEMORY_SHARD_COUNT as u64) as usize
+    }
+
+    fn active_shard(&self, series_id: SeriesId) -> &RwLock<HashMap<SeriesId, ActiveSeriesState>> {
+        &self.active_builders[Self::series_shard_idx(series_id)]
+    }
+
+    fn sealed_shard(
+        &self,
+        series_id: SeriesId,
+    ) -> &RwLock<HashMap<SeriesId, BTreeMap<SealedChunkKey, Chunk>>> {
+        &self.sealed_chunks[Self::series_shard_idx(series_id)]
     }
 
     fn spawn_background_compaction_thread(
@@ -444,7 +461,7 @@ impl ChunkStorage {
     fn append_sealed_chunk(&self, series_id: SeriesId, chunk: Chunk) {
         let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
         let key = SealedChunkKey::from_chunk(&chunk, sequence);
-        let mut sealed = self.sealed_chunks.write();
+        let mut sealed = self.sealed_shard(series_id).write();
         sealed.entry(series_id).or_default().insert(key, chunk);
     }
 
@@ -452,10 +469,12 @@ impl ChunkStorage {
         let mut finalized = Vec::new();
 
         {
-            let mut active = self.active_builders.write();
-            for (series_id, state) in active.iter_mut() {
-                if let Some(chunk) = state.flush_partial()? {
-                    finalized.push((*series_id, chunk));
+            for shard in &self.active_builders {
+                let mut active = shard.write();
+                for (series_id, state) in active.iter_mut() {
+                    if let Some(chunk) = state.flush_partial()? {
+                        finalized.push((*series_id, chunk));
+                    }
                 }
             }
         }
@@ -531,7 +550,7 @@ impl ChunkStorage {
         }
 
         {
-            let sealed = self.sealed_chunks.read();
+            let sealed = self.sealed_shard(series_id).read();
             if let Some(chunks) = sealed.get(&series_id) {
                 let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
                 for (_, chunk) in chunks.range(..end_bound) {
@@ -562,7 +581,7 @@ impl ChunkStorage {
         }
 
         {
-            let active = self.active_builders.read();
+            let active = self.active_shard(series_id).read();
             if let Some(state) = active.get(&series_id) {
                 let mut previous_active_ts = i64::MIN;
                 let mut has_previous_active = false;
@@ -646,7 +665,7 @@ impl ChunkStorage {
 
     fn validate_series_lane_compatible(&self, series_id: SeriesId, lane: ValueLane) -> Result<()> {
         if let Some(active_lane) = self
-            .active_builders
+            .active_shard(series_id)
             .read()
             .get(&series_id)
             .map(|state| state.lane)
@@ -660,7 +679,7 @@ impl ChunkStorage {
         }
 
         if let Some(sealed_lane) = self
-            .sealed_chunks
+            .sealed_shard(series_id)
             .read()
             .get(&series_id)
             .and_then(|chunks| chunks.last_key_value().map(|(_, chunk)| chunk))
@@ -700,29 +719,44 @@ impl ChunkStorage {
 
     fn reserve_series_lanes(&self, points: &[PendingPoint]) -> Result<Vec<SeriesId>> {
         let series_lanes = Self::collect_pending_series_lanes(points)?;
-        let mut active = self.active_builders.write();
+        let mut lanes_by_shard = BTreeMap::<usize, Vec<(SeriesId, ValueLane)>>::new();
+        for (series_id, lane) in series_lanes {
+            lanes_by_shard
+                .entry(Self::series_shard_idx(series_id))
+                .or_default()
+                .push((series_id, lane));
+        }
 
-        for (series_id, lane) in &series_lanes {
-            if let Some(state) = active.get(series_id) {
-                if state.lane != *lane {
-                    return Err(TsinkError::ValueTypeMismatch {
-                        expected: lane_name(state.lane).to_string(),
-                        actual: lane_name(*lane).to_string(),
-                    });
+        let mut shard_guards = Vec::with_capacity(lanes_by_shard.len());
+        for (shard_idx, entries) in lanes_by_shard {
+            shard_guards.push((entries, self.active_builders[shard_idx].write()));
+        }
+
+        for (entries, active) in &shard_guards {
+            for (series_id, lane) in entries {
+                if let Some(state) = active.get(series_id) {
+                    if state.lane != *lane {
+                        return Err(TsinkError::ValueTypeMismatch {
+                            expected: lane_name(state.lane).to_string(),
+                            actual: lane_name(*lane).to_string(),
+                        });
+                    }
                 }
             }
         }
 
         let mut reserved = Vec::new();
-        for (series_id, lane) in series_lanes {
-            if active.contains_key(&series_id) {
-                continue;
+        for (entries, active) in &mut shard_guards {
+            for (series_id, lane) in entries {
+                if active.contains_key(series_id) {
+                    continue;
+                }
+                active.insert(
+                    *series_id,
+                    ActiveSeriesState::new(*series_id, *lane, self.chunk_point_cap),
+                );
+                reserved.push(*series_id);
             }
-            active.insert(
-                series_id,
-                ActiveSeriesState::new(series_id, lane, self.chunk_point_cap),
-            );
-            reserved.push(series_id);
         }
 
         Ok(reserved)
@@ -733,14 +767,24 @@ impl ChunkStorage {
             return;
         }
 
-        let mut active = self.active_builders.write();
-        for series_id in series_ids {
-            let should_remove = active
-                .get(series_id)
-                .map(|state| state.builder.is_empty())
-                .unwrap_or(false);
-            if should_remove {
-                active.remove(series_id);
+        let mut ids_by_shard = BTreeMap::<usize, Vec<SeriesId>>::new();
+        for &series_id in series_ids {
+            ids_by_shard
+                .entry(Self::series_shard_idx(series_id))
+                .or_default()
+                .push(series_id);
+        }
+
+        for (shard_idx, shard_series_ids) in ids_by_shard {
+            let mut active = self.active_builders[shard_idx].write();
+            for series_id in shard_series_ids {
+                let should_remove = active
+                    .get(&series_id)
+                    .map(|state| state.builder.is_empty())
+                    .unwrap_or(false);
+                if should_remove {
+                    active.remove(&series_id);
+                }
             }
         }
     }
@@ -753,7 +797,7 @@ impl ChunkStorage {
         value: Value,
     ) -> Result<()> {
         let finalized = {
-            let mut active = self.active_builders.write();
+            let mut active = self.active_shard(series_id).write();
             let state = active
                 .entry(series_id)
                 .or_insert_with(|| ActiveSeriesState::new(series_id, lane, self.chunk_point_cap));
@@ -819,8 +863,6 @@ impl ChunkStorage {
         points: &[PendingPoint],
         grouped: &BTreeMap<SeriesId, (ValueLane, Vec<usize>)>,
     ) -> Result<()> {
-        let active = self.active_builders.read();
-
         for (series_id, (lane, indexes)) in grouped {
             let Some((&first_idx, remaining)) = indexes.split_first() else {
                 continue;
@@ -840,7 +882,9 @@ impl ChunkStorage {
                 }
             }
 
-            if let Some(existing_point) = active
+            if let Some(existing_point) = self
+                .active_shard(*series_id)
+                .read()
                 .get(series_id)
                 .and_then(|state| state.builder.first_point())
             {
@@ -1001,19 +1045,21 @@ impl ChunkStorage {
         }
 
         let delta_chunks = {
-            let sealed = self.sealed_chunks.read();
             let persisted = self.persisted_chunk_watermarks.read();
 
             let mut delta = HashMap::new();
-            for (series_id, chunks) in sealed.iter() {
-                let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
-                let updates = chunks
-                    .iter()
-                    .filter(|(key, _)| key.sequence > persisted_sequence)
-                    .map(|(_, chunk)| chunk.clone())
-                    .collect::<Vec<_>>();
-                if !updates.is_empty() {
-                    delta.insert(*series_id, updates);
+            for shard in &self.sealed_chunks {
+                let sealed = shard.read();
+                for (series_id, chunks) in sealed.iter() {
+                    let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
+                    let updates = chunks
+                        .iter()
+                        .filter(|(key, _)| key.sequence > persisted_sequence)
+                        .map(|(_, chunk)| chunk.clone())
+                        .collect::<Vec<_>>();
+                    if !updates.is_empty() {
+                        delta.insert(*series_id, updates);
+                    }
                 }
             }
             delta
@@ -1060,16 +1106,18 @@ impl ChunkStorage {
         }
 
         {
-            let sealed = self.sealed_chunks.read();
             let mut persisted = self.persisted_chunk_watermarks.write();
             persisted.clear();
-            for (series_id, chunks) in sealed.iter() {
-                let watermark = chunks
-                    .keys()
-                    .next_back()
-                    .map(|key| key.sequence)
-                    .unwrap_or(0);
-                persisted.insert(*series_id, watermark);
+            for shard in &self.sealed_chunks {
+                let sealed = shard.read();
+                for (series_id, chunks) in sealed.iter() {
+                    let watermark = chunks
+                        .keys()
+                        .next_back()
+                        .map(|key| key.sequence)
+                        .unwrap_or(0);
+                    persisted.insert(*series_id, watermark);
+                }
             }
         }
 
@@ -1711,13 +1759,13 @@ mod tests {
             .unwrap()
             .series_id;
 
-        let sealed = storage.sealed_chunks.read();
+        let sealed = storage.sealed_chunks[ChunkStorage::series_shard_idx(series_id)].read();
         let chunks = sealed.get(&series_id).unwrap().values().collect::<Vec<_>>();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].header.point_count, 2);
         assert_eq!(chunks[1].header.point_count, 2);
 
-        let active = storage.active_builders.read();
+        let active = storage.active_builders[ChunkStorage::series_shard_idx(series_id)].read();
         let state = active.get(&series_id).unwrap();
         assert_eq!(state.builder.len(), 1);
     }
@@ -1750,11 +1798,11 @@ mod tests {
             .unwrap()
             .series_id;
 
-        let active = storage.active_builders.read();
+        let active = storage.active_builders[ChunkStorage::series_shard_idx(series_id)].read();
         assert_eq!(active.get(&series_id).unwrap().builder.len(), 1);
         drop(active);
 
-        let sealed = storage.sealed_chunks.read();
+        let sealed = storage.sealed_chunks[ChunkStorage::series_shard_idx(series_id)].read();
         assert_eq!(sealed.get(&series_id).unwrap().len(), 1);
     }
 
@@ -1785,11 +1833,11 @@ mod tests {
             .unwrap()
             .series_id;
 
-        let active = storage.active_builders.read();
+        let active = storage.active_builders[ChunkStorage::series_shard_idx(series_id)].read();
         assert_eq!(active.get(&series_id).unwrap().builder.len(), 3);
         drop(active);
 
-        let sealed = storage.sealed_chunks.read();
+        let sealed = storage.sealed_chunks[ChunkStorage::series_shard_idx(series_id)].read();
         assert!(sealed.get(&series_id).is_none());
     }
 
@@ -2088,7 +2136,11 @@ mod tests {
             },
         ));
 
-        let active_read_guard = storage.active_builders.read();
+        let active_read_guards = storage
+            .active_builders
+            .iter()
+            .map(|shard| shard.read())
+            .collect::<Vec<_>>();
 
         let writer_storage = Arc::clone(&storage);
         let (writer_tx, writer_rx) = mpsc::channel();
@@ -2112,7 +2164,7 @@ mod tests {
             .expect("list_metrics should not block on in-flight WAL/ingest work");
         assert!(reader_result.is_ok());
 
-        drop(active_read_guard);
+        drop(active_read_guards);
 
         let writer_result = writer_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(writer_result.is_ok());
@@ -2151,7 +2203,11 @@ mod tests {
         let start = Arc::new(Barrier::new(3));
         let (tx, rx) = mpsc::channel();
 
-        let active_read_guard = storage.active_builders.read();
+        let active_read_guards = storage
+            .active_builders
+            .iter()
+            .map(|shard| shard.read())
+            .collect::<Vec<_>>();
 
         let thread_storage = Arc::clone(&storage);
         let thread_labels = labels.clone();
@@ -2205,7 +2261,7 @@ mod tests {
 
         assert_eq!(pre_release_sample_batches, 0);
 
-        drop(active_read_guard);
+        drop(active_read_guards);
 
         let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -2828,7 +2884,7 @@ mod tests {
             .unwrap()
             .series_id;
 
-        let sealed = storage.sealed_chunks.read();
+        let sealed = storage.sealed_chunks[ChunkStorage::series_shard_idx(series_id)].read();
         let chunks = sealed.get(&series_id).unwrap().values().collect::<Vec<_>>();
         assert_eq!(
             chunks.len(),
@@ -2838,7 +2894,7 @@ mod tests {
         assert_eq!(chunks[0].header.min_ts, 1);
         assert_eq!(chunks[0].header.max_ts, 1);
 
-        let active = storage.active_builders.read();
+        let active = storage.active_builders[ChunkStorage::series_shard_idx(series_id)].read();
         assert_eq!(active.get(&series_id).unwrap().builder.len(), 1);
     }
 

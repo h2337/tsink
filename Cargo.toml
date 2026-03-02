@@ -13,6 +13,7 @@ readme = "README.md"
 
 [workspace]
 members = [".", "crates/tsink-server", "crates/tsink-uniffi"]
+default-members = [".", "crates/tsink-server", "crates/tsink-uniffi"]
 resolver = "2"
 
 [dependencies]

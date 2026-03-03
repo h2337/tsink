@@ -316,6 +316,7 @@ impl ActiveSeriesState {
             &mut self.builder,
             ChunkBuilder::new(self.series_id, self.lane, self.point_cap),
         );
+        let points_are_sorted = old_builder.is_sorted_by_ts();
         self.builder_value_heap_bytes = 0;
         let mut chunk = old_builder
             .finalize(
@@ -326,8 +327,10 @@ impl ActiveSeriesState {
                 TsinkError::InvalidConfiguration("failed to finalize chunk".to_string())
             })?;
 
-        // Preserve a monotonic timestamp stream per chunk for better timestamp codec density.
-        chunk.points.sort_by_key(|point| point.ts);
+        if !points_are_sorted {
+            // Preserve a monotonic timestamp stream per chunk for better timestamp codec density.
+            chunk.points.sort_by_key(|point| point.ts);
+        }
 
         let encoded = Encoder::encode_chunk_points(&chunk.points, self.lane)?;
         chunk.header.ts_codec = encoded.ts_codec;
@@ -5081,6 +5084,36 @@ mod tests {
         let active = storage.active_builders[ChunkStorage::series_shard_idx(series_id)].read();
         let state = active.get(&series_id).unwrap();
         assert_eq!(state.builder.len(), 1);
+    }
+
+    #[test]
+    fn finalize_sorts_out_of_order_chunk_points() {
+        let storage = ChunkStorage::new(2, None);
+        let labels = vec![Label::new("host", "a")];
+
+        storage
+            .insert_rows(&[
+                Row::with_labels("latency", labels.clone(), DataPoint::new(2, 2.0)),
+                Row::with_labels("latency", labels.clone(), DataPoint::new(1, 1.0)),
+            ])
+            .unwrap();
+
+        let series_id = storage
+            .registry
+            .read()
+            .resolve_existing("latency", &labels)
+            .unwrap()
+            .series_id;
+
+        let sealed = storage.sealed_chunks[ChunkStorage::series_shard_idx(series_id)].read();
+        let chunks = sealed.get(&series_id).unwrap().values().collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 1);
+        let timestamps = chunks[0]
+            .points
+            .iter()
+            .map(|point| point.ts)
+            .collect::<Vec<_>>();
+        assert_eq!(timestamps, vec![1, 2]);
     }
 
     #[test]

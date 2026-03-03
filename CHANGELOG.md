@@ -13,6 +13,7 @@ tsink
 - Replace admission-time full memory scans with incremental per-shard memory accounting updated on mutations; keep full scans for reconciliation/debug paths
 - Remove duplicate write-path WAL serialization by pre-encoding series/sample frame payloads once and reusing encoded bytes for both admission sizing and append
 - Merge insert-path cardinality projection and series resolution into one registry pass to shorten write-lock hold time and reduce contention
+- Skip unconditional active-chunk finalize sort when append timestamps are already monotonic; only sort out-of-order chunks
 - Add atomic snapshot/restore APIs (`Storage::snapshot`, `StorageBuilder::restore_from_snapshot`) with segment-consistent, WAL-aware backups
 tsink-server
 - Deepen `/metrics` exposition with WAL/flush/compaction/query internal counters and gauges

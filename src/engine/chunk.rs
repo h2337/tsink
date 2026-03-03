@@ -58,6 +58,8 @@ pub struct ChunkBuilder {
     lane: ValueLane,
     max_points: usize,
     points: Vec<ChunkPoint>,
+    is_sorted_by_ts: bool,
+    last_ts: Option<i64>,
 }
 
 impl ChunkBuilder {
@@ -67,10 +69,18 @@ impl ChunkBuilder {
             lane,
             max_points: max_points.max(1),
             points: Vec::with_capacity(max_points.max(1)),
+            is_sorted_by_ts: true,
+            last_ts: None,
         }
     }
 
     pub fn append(&mut self, ts: i64, value: Value) {
+        if let Some(last_ts) = self.last_ts {
+            if ts < last_ts {
+                self.is_sorted_by_ts = false;
+            }
+        }
+        self.last_ts = Some(ts);
         self.points.push(ChunkPoint { ts, value });
     }
 
@@ -98,6 +108,10 @@ impl ChunkBuilder {
         &self.points
     }
 
+    pub(crate) fn is_sorted_by_ts(&self) -> bool {
+        self.is_sorted_by_ts
+    }
+
     pub fn finalize(self, ts_codec: TimestampCodecId, value_codec: ValueCodecId) -> Option<Chunk> {
         if self.points.is_empty() {
             return None;
@@ -120,5 +134,30 @@ impl ChunkBuilder {
             points: self.points,
             encoded_payload: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkBuilder, ValueLane};
+    use crate::value::Value;
+
+    #[test]
+    fn builder_tracks_monotonic_timestamps() {
+        let mut builder = ChunkBuilder::new(1, ValueLane::Numeric, 4);
+        builder.append(10, Value::I64(1));
+        builder.append(11, Value::I64(2));
+        builder.append(11, Value::I64(3));
+        builder.append(15, Value::I64(4));
+        assert!(builder.is_sorted_by_ts());
+    }
+
+    #[test]
+    fn builder_marks_unsorted_after_backwards_append() {
+        let mut builder = ChunkBuilder::new(1, ValueLane::Numeric, 4);
+        builder.append(10, Value::I64(1));
+        builder.append(12, Value::I64(2));
+        builder.append(11, Value::I64(3));
+        assert!(!builder.is_sorted_by_ts());
     }
 }

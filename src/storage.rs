@@ -141,6 +141,7 @@ pub struct StorageObservabilitySnapshot {
     pub flush: FlushObservabilitySnapshot,
     pub compaction: CompactionObservabilitySnapshot,
     pub query: QueryObservabilitySnapshot,
+    pub health: StorageHealthSnapshot,
 }
 
 /// WAL internals snapshot.
@@ -231,6 +232,16 @@ pub struct QueryObservabilitySnapshot {
     pub select_series_returned_total: u64,
     pub merge_path_queries_total: u64,
     pub append_sort_path_queries_total: u64,
+}
+
+/// Engine health/status snapshot.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct StorageHealthSnapshot {
+    pub background_errors_total: u64,
+    pub degraded: bool,
+    pub fail_fast_enabled: bool,
+    pub fail_fast_triggered: bool,
+    pub last_background_error: Option<String>,
 }
 
 /// Storage provides thread-safe capabilities for insertion and retrieval from time-series storage.
@@ -336,6 +347,7 @@ pub struct StorageBuilder {
     wal_size_limit_bytes: usize,
     wal_buffer_size: usize,
     wal_sync_mode: WalSyncMode,
+    background_fail_fast: bool,
 }
 
 impl Default for StorageBuilder {
@@ -355,6 +367,7 @@ impl Default for StorageBuilder {
             wal_size_limit_bytes: usize::MAX,
             wal_buffer_size: 4096,
             wal_sync_mode: WalSyncMode::default(),
+            background_fail_fast: false,
         }
     }
 }
@@ -477,6 +490,13 @@ impl StorageBuilder {
         self
     }
 
+    /// Enables fail-fast mode when background flush/compaction workers hit errors.
+    #[must_use]
+    pub fn with_background_fail_fast(mut self, enabled: bool) -> Self {
+        self.background_fail_fast = enabled;
+        self
+    }
+
     /// Builds the Storage instance.
     pub fn build(self) -> Result<Arc<dyn Storage>> {
         crate::engine::build_storage(self)
@@ -544,6 +564,10 @@ impl StorageBuilder {
 
     pub(crate) fn wal_sync_mode(&self) -> WalSyncMode {
         self.wal_sync_mode
+    }
+
+    pub(crate) fn background_fail_fast(&self) -> bool {
+        self.background_fail_fast
     }
 }
 

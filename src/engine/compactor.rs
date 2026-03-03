@@ -1,24 +1,38 @@
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::encoder::Encoder;
+use crate::engine::fs_utils::{remove_dir_if_exists, write_file_atomically_and_sync_parent};
 use crate::engine::segment::{
     load_segments, load_segments_for_level, LoadedSegment, PersistedSeries, SegmentWriter,
 };
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::{Result, TsinkError};
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
 const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 8;
 const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
+const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
+const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
+static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 type SeriesChunkRefs<'a> = HashMap<SeriesId, Vec<&'a Chunk>>;
 type MergeSegmentsOutput<'a> = (Vec<PersistedSeries>, SeriesChunkRefs<'a>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactionReplacementMarker {
+    version: u16,
+    source_segments: Vec<String>,
+    output_segments: Vec<String>,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompactionRunStats {
@@ -47,6 +61,194 @@ pub struct Compactor {
     l0_trigger: usize,
     l1_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
+}
+
+fn compaction_replacement_dir(data_path: &Path) -> PathBuf {
+    data_path.join(COMPACTION_REPLACEMENT_DIR)
+}
+
+fn validate_relative_segment_path(path: &str) -> Result<&Path> {
+    let candidate = Path::new(path);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "invalid compaction replacement path: {path}"
+        )));
+    }
+    Ok(candidate)
+}
+
+fn segment_rel_path(data_path: &Path, segment_root: &Path) -> Result<String> {
+    let relative = segment_root.strip_prefix(data_path).map_err(|_| {
+        TsinkError::InvalidConfiguration(format!(
+            "segment root {} is outside compactor data path {}",
+            segment_root.display(),
+            data_path.display()
+        ))
+    })?;
+
+    Ok(relative.to_string_lossy().into_owned())
+}
+
+fn replacement_marker_path(data_path: &Path) -> PathBuf {
+    let ts_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let nonce = COMPACTION_REPLACEMENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    compaction_replacement_dir(data_path).join(format!("replace-{ts_nanos:016x}-{nonce:016x}.json"))
+}
+
+fn write_compaction_replacement_marker(
+    data_path: &Path,
+    source_segments: &[PathBuf],
+    output_segments: &[PathBuf],
+) -> Result<PathBuf> {
+    if source_segments.is_empty() || output_segments.is_empty() {
+        return Err(TsinkError::InvalidConfiguration(
+            "compaction replacement marker requires source and output segments".to_string(),
+        ));
+    }
+
+    let source_segments = source_segments
+        .iter()
+        .map(|path| segment_rel_path(data_path, path))
+        .collect::<Result<Vec<_>>>()?;
+    let output_segments = output_segments
+        .iter()
+        .map(|path| segment_rel_path(data_path, path))
+        .collect::<Result<Vec<_>>>()?;
+    let marker = CompactionReplacementMarker {
+        version: COMPACTION_REPLACEMENT_VERSION,
+        source_segments,
+        output_segments,
+    };
+
+    let marker_dir = compaction_replacement_dir(data_path);
+    fs::create_dir_all(&marker_dir)?;
+    let marker_path = replacement_marker_path(data_path);
+    let payload = serde_json::to_vec(&marker)?;
+    write_file_atomically_and_sync_parent(&marker_path, &payload)?;
+    Ok(marker_path)
+}
+
+fn parse_compaction_replacement_marker(path: &Path) -> Result<CompactionReplacementMarker> {
+    let bytes = fs::read(path)?;
+    let marker: CompactionReplacementMarker = serde_json::from_slice(&bytes)?;
+    if marker.version != COMPACTION_REPLACEMENT_VERSION {
+        return Err(TsinkError::DataCorruption(format!(
+            "unsupported compaction replacement marker version {}",
+            marker.version
+        )));
+    }
+    if marker.source_segments.is_empty() || marker.output_segments.is_empty() {
+        return Err(TsinkError::DataCorruption(
+            "compaction replacement marker has empty segment sets".to_string(),
+        ));
+    }
+    Ok(marker)
+}
+
+fn apply_compaction_replacement_marker(data_path: &Path, marker_path: &Path) -> Result<()> {
+    let marker = parse_compaction_replacement_marker(marker_path)?;
+
+    let output_segments = marker
+        .output_segments
+        .iter()
+        .map(|path| {
+            let relative = validate_relative_segment_path(path)?;
+            Ok(data_path.join(relative))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let source_segments = marker
+        .source_segments
+        .iter()
+        .map(|path| {
+            let relative = validate_relative_segment_path(path)?;
+            Ok(data_path.join(relative))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for output in &output_segments {
+        if !output.join("manifest.bin").exists() {
+            return Err(TsinkError::DataCorruption(format!(
+                "compaction replacement output segment missing manifest: {}",
+                output.display()
+            )));
+        }
+    }
+
+    for source in &source_segments {
+        remove_dir_if_exists(source).map_err(|err| TsinkError::IoWithPath {
+            path: source.clone(),
+            source: err,
+        })?;
+    }
+
+    match fs::remove_file(marker_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(TsinkError::IoWithPath {
+                path: marker_path.to_path_buf(),
+                source: err,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn rollback_output_segments(output_segments: &[PathBuf]) -> Result<()> {
+    for segment in output_segments.iter().rev() {
+        remove_dir_if_exists(segment).map_err(|err| TsinkError::IoWithPath {
+            path: segment.clone(),
+            source: err,
+        })?;
+    }
+    Ok(())
+}
+
+pub(super) fn finalize_pending_compaction_replacements(data_path: &Path) -> Result<()> {
+    let marker_dir = compaction_replacement_dir(data_path);
+    let read_dir = match fs::read_dir(&marker_dir) {
+        Ok(read_dir) => read_dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(TsinkError::IoWithPath {
+                path: marker_dir,
+                source: err,
+            });
+        }
+    };
+
+    let mut marker_paths = Vec::new();
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(TsinkError::IoWithPath {
+                    path: marker_dir.clone(),
+                    source: err,
+                });
+            }
+        };
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        marker_paths.push(entry.path());
+    }
+    marker_paths.sort();
+
+    for marker_path in marker_paths {
+        apply_compaction_replacement_marker(data_path, &marker_path)?;
+    }
+
+    Ok(())
 }
 
 impl Compactor {
@@ -79,6 +281,8 @@ impl Compactor {
     }
 
     pub fn compact_once_with_stats(&self) -> Result<CompactionRunStats> {
+        finalize_pending_compaction_replacements(&self.data_path)?;
+
         if let Some(stats) =
             self.try_compact_level(CompactionLevel::L0, CompactionLevel::L1, self.l0_trigger)?
         {
@@ -133,6 +337,10 @@ impl Compactor {
         target_level: u8,
         segments: &[&LoadedSegment],
     ) -> Result<CompactionRunStats> {
+        let source_roots = segments
+            .iter()
+            .map(|segment| segment.root.clone())
+            .collect::<Vec<_>>();
         let source_segments = segments.len();
         let (series, chunks_by_series) = collect_series_and_chunk_refs(segments)?;
         let source_chunks = chunks_by_series
@@ -177,31 +385,49 @@ impl Compactor {
         let mut emitted_segments = 0usize;
         let mut emitted_chunks = 0usize;
         let mut emitted_points = 0usize;
+        let mut output_roots = Vec::<PathBuf>::new();
+        let write_outputs_result = (|| -> Result<()> {
+            for series_def in &series {
+                let series_id = series_def.series_id;
+                let Some(chunks) = chunks_by_series.get(&series_id) else {
+                    continue;
+                };
 
-        for series_def in &series {
-            let series_id = series_def.series_id;
-            let Some(chunks) = chunks_by_series.get(&series_id) else {
-                continue;
-            };
+                stream_merge_series_chunks(series_id, chunks, self.point_cap, |chunk| {
+                    emitted_chunks = emitted_chunks.saturating_add(1);
+                    emitted_points =
+                        emitted_points.saturating_add(chunk.header.point_count as usize);
+                    pending_points =
+                        pending_points.saturating_add(chunk.header.point_count as usize);
+                    pending_chunks.entry(series_id).or_default().push(chunk);
+                    if pending_points >= output_segment_point_budget {
+                        let output_root =
+                            self.flush_compacted_segment(target_level, &registry, &pending_chunks)?;
+                        output_roots.push(output_root);
+                        pending_chunks.clear();
+                        pending_points = 0;
+                        emitted_segments = emitted_segments.saturating_add(1);
+                    }
+                    Ok(())
+                })?;
+            }
 
-            stream_merge_series_chunks(series_id, chunks, self.point_cap, |chunk| {
-                emitted_chunks = emitted_chunks.saturating_add(1);
-                emitted_points = emitted_points.saturating_add(chunk.header.point_count as usize);
-                pending_points = pending_points.saturating_add(chunk.header.point_count as usize);
-                pending_chunks.entry(series_id).or_default().push(chunk);
-                if pending_points >= output_segment_point_budget {
+            if !pending_chunks.is_empty() {
+                let output_root =
                     self.flush_compacted_segment(target_level, &registry, &pending_chunks)?;
-                    pending_chunks.clear();
-                    pending_points = 0;
-                    emitted_segments = emitted_segments.saturating_add(1);
-                }
-                Ok(())
-            })?;
-        }
+                output_roots.push(output_root);
+                emitted_segments = emitted_segments.saturating_add(1);
+            }
 
-        if !pending_chunks.is_empty() {
-            self.flush_compacted_segment(target_level, &registry, &pending_chunks)?;
-            emitted_segments = emitted_segments.saturating_add(1);
+            Ok(())
+        })();
+        if let Err(err) = write_outputs_result {
+            if let Err(rollback_err) = rollback_output_segments(&output_roots) {
+                return Err(TsinkError::Other(format!(
+                    "compaction output write failed and rollback failed: write={err}, rollback={rollback_err}"
+                )));
+            }
+            return Err(err);
         }
 
         if emitted_segments == 0 {
@@ -218,9 +444,9 @@ impl Compactor {
             });
         }
 
-        for segment in segments {
-            fs::remove_dir_all(&segment.root)?;
-        }
+        let replacement_marker_path =
+            write_compaction_replacement_marker(&self.data_path, &source_roots, &output_roots)?;
+        apply_compaction_replacement_marker(&self.data_path, &replacement_marker_path)?;
 
         Ok(CompactionRunStats {
             compacted: true,
@@ -240,9 +466,11 @@ impl Compactor {
         target_level: u8,
         registry: &SeriesRegistry,
         chunks_by_series: &HashMap<SeriesId, Vec<Chunk>>,
-    ) -> Result<()> {
+    ) -> Result<PathBuf> {
         if chunks_by_series.is_empty() {
-            return Ok(());
+            return Err(TsinkError::InvalidConfiguration(
+                "cannot flush empty compacted segment".to_string(),
+            ));
         }
 
         let next_segment_id = match &self.next_segment_id {
@@ -251,7 +479,7 @@ impl Compactor {
         };
         let writer = SegmentWriter::new(&self.data_path, target_level, next_segment_id)?;
         writer.write_segment(registry, chunks_by_series)?;
-        Ok(())
+        Ok(writer.layout().root.clone())
     }
 }
 
@@ -628,7 +856,9 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::Compactor;
+    use super::{
+        finalize_pending_compaction_replacements, write_compaction_replacement_marker, Compactor,
+    };
     use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
     use crate::engine::encoder::Encoder;
     use crate::engine::segment::{load_segments, load_segments_for_level, SegmentWriter};
@@ -808,6 +1038,58 @@ mod tests {
             .map(|chunk| chunk.header.point_count as usize)
             .sum::<usize>();
         assert_eq!(total_points, 1200);
+    }
+
+    #[test]
+    fn finalize_pending_replacements_removes_marked_source_segments() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = SeriesRegistry::new();
+
+        let series_id = registry
+            .resolve_or_insert("cpu", &[Label::new("host", "a")])
+            .unwrap()
+            .series_id;
+
+        let mut l0_chunks = HashMap::new();
+        l0_chunks.insert(series_id, vec![make_numeric_chunk(series_id, &[(1, 1.0)])]);
+        SegmentWriter::new(temp_dir.path(), 0, 1)
+            .unwrap()
+            .write_segment(&registry, &l0_chunks)
+            .unwrap();
+
+        let mut l1_chunks = HashMap::new();
+        l1_chunks.insert(series_id, vec![make_numeric_chunk(series_id, &[(1, 2.0)])]);
+        SegmentWriter::new(temp_dir.path(), 1, 2)
+            .unwrap()
+            .write_segment(&registry, &l1_chunks)
+            .unwrap();
+
+        let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+        let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+        assert_eq!(l0.len(), 1);
+        assert_eq!(l1.len(), 1);
+
+        let source_root = l0[0].root.clone();
+        let output_root = l1[0].root.clone();
+        let marker_path = write_compaction_replacement_marker(
+            temp_dir.path(),
+            std::slice::from_ref(&source_root),
+            std::slice::from_ref(&output_root),
+        )
+        .unwrap();
+        assert!(marker_path.exists());
+
+        finalize_pending_compaction_replacements(temp_dir.path()).unwrap();
+
+        assert!(!source_root.exists(), "source segment should be removed");
+        assert!(
+            output_root.exists(),
+            "replacement output should be preserved"
+        );
+        assert!(
+            !marker_path.exists(),
+            "replacement marker should be removed after apply"
+        );
     }
 
     fn make_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {

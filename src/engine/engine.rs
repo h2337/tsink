@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,8 @@ mod maintenance;
 mod metrics;
 #[path = "observability.rs"]
 mod observability;
+#[path = "process_lock.rs"]
+mod process_lock;
 #[path = "query_exec.rs"]
 mod query_exec;
 #[path = "runtime.rs"]
@@ -50,6 +52,7 @@ mod state;
 
 use config::ChunkStorageOptions;
 use metrics::StorageObservabilityCounters;
+use process_lock::DataPathProcessLock;
 use state::{
     ActiveSeriesState, PersistedChunkRef, PersistedIndexState, SealedChunkKey, BLOB_LANE_ROOT,
     NUMERIC_LANE_ROOT, SERIES_INDEX_FILE_NAME, WAL_DIR_NAME,
@@ -114,7 +117,9 @@ pub struct ChunkStorage {
     flush_visibility_lock: RwLock<()>,
     compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    data_path_process_lock: Mutex<Option<DataPathProcessLock>>,
     observability: Arc<StorageObservabilityCounters>,
+    background_fail_fast: bool,
 }
 
 impl Storage for ChunkStorage {

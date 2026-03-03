@@ -253,6 +253,7 @@ fn retention_sweep_reload_failure_keeps_existing_persisted_data_visible() {
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: false,
+            background_fail_fast: false,
         },
     )
     .unwrap();

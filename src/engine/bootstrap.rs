@@ -7,6 +7,10 @@ use crate::engine::segment::load_segment_indexes_with_series;
 pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
     let wal_enabled = builder.wal_enabled();
     let storage_options = ChunkStorageOptions::from(&builder);
+    let data_path_process_lock = builder
+        .data_path()
+        .map(process_lock::DataPathProcessLock::acquire)
+        .transpose()?;
     let config::StoragePathLayout {
         numeric_lane_path,
         blob_lane_path,
@@ -30,6 +34,13 @@ pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>>
         None
     };
     let load_series_from_segments = persisted_registry.is_none();
+
+    if let Some(path) = &numeric_lane_path {
+        crate::engine::compactor::finalize_pending_compaction_replacements(path)?;
+    }
+    if let Some(path) = &blob_lane_path {
+        crate::engine::compactor::finalize_pending_compaction_replacements(path)?;
+    }
 
     let loaded_numeric = if let Some(path) = &numeric_lane_path {
         load_segment_indexes_with_series(path, load_series_from_segments)?
@@ -74,6 +85,9 @@ pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>>
         loaded_segments.next_segment_id,
         storage_options,
     )?);
+    if let Some(data_path_process_lock) = data_path_process_lock {
+        storage.install_data_path_process_lock(data_path_process_lock);
+    }
     if let Some(registry) = persisted_registry {
         storage.replace_registry_from_snapshot(registry);
     }
@@ -85,7 +99,7 @@ pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>>
         storage.refresh_memory_usage();
         storage.enforce_memory_budget_if_needed()?;
     }
-    if wal_enabled {
+    if storage_options.background_threads_enabled {
         storage.start_background_flush_thread(DEFAULT_FLUSH_INTERVAL)?;
     }
 

@@ -48,6 +48,7 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: Duration::from_millis(25),
             background_threads_enabled: true,
+            background_fail_fast: false,
         },
     )
     .unwrap();
@@ -177,6 +178,7 @@ fn flush_pipeline_waits_for_busy_writer_permit() {
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: false,
+            background_fail_fast: false,
         },
     )
     .unwrap();
@@ -229,5 +231,59 @@ fn flush_pipeline_waits_for_busy_writer_permit() {
         "flush pipeline should persist after blocked writer permit is released"
     );
 
+    storage.close().unwrap();
+}
+
+#[test]
+fn wal_disabled_persistent_storage_still_runs_background_flush() {
+    use std::thread;
+    use std::time::Instant;
+
+    let temp_dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "a")];
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(2)
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "wal_disabled_background",
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            ),
+            Row::with_labels(
+                "wal_disabled_background",
+                labels.clone(),
+                DataPoint::new(2, 2.0),
+            ),
+            Row::with_labels(
+                "wal_disabled_background",
+                labels.clone(),
+                DataPoint::new(3, 3.0),
+            ),
+        ])
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut persisted = false;
+    while Instant::now() < deadline {
+        if !load_segments_for_level(&lane_path, 0).unwrap().is_empty() {
+            persisted = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    assert!(
+        persisted,
+        "background flush should persist segments even when WAL is disabled"
+    );
     storage.close().unwrap();
 }

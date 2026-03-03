@@ -7,6 +7,7 @@ pub(super) struct StorageObservabilityCounters {
     pub(super) flush: FlushObservabilityCounters,
     pub(super) compaction: CompactionObservabilityCounters,
     pub(super) query: QueryObservabilityCounters,
+    pub(super) health: HealthObservabilityState,
 }
 
 impl StorageObservabilityCounters {
@@ -54,6 +55,24 @@ impl StorageObservabilityCounters {
         self.compaction
             .duration_nanos_total
             .fetch_add(duration_nanos, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_background_worker_error(
+        &self,
+        worker: &'static str,
+        error: &TsinkError,
+        fail_fast_enabled: bool,
+    ) {
+        self.health
+            .background_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        *self.health.last_background_error.write() =
+            Some(format!("{worker} worker error: {error}"));
+        if fail_fast_enabled {
+            self.health
+                .fail_fast_triggered
+                .store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -135,4 +154,11 @@ pub(super) struct QueryObservabilityCounters {
     pub(super) select_series_returned_total: AtomicU64,
     pub(super) merge_path_queries_total: AtomicU64,
     pub(super) append_sort_path_queries_total: AtomicU64,
+}
+
+#[derive(Default)]
+pub(super) struct HealthObservabilityState {
+    pub(super) background_errors_total: AtomicU64,
+    pub(super) fail_fast_triggered: AtomicBool,
+    pub(super) last_background_error: RwLock<Option<String>>,
 }

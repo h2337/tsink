@@ -204,7 +204,7 @@ impl ChunkStorage {
         }
     }
 
-    pub(super) fn persist_segment(&self, include_wal_highwater: bool) -> Result<bool> {
+    pub(super) fn persist_segment(&self, _include_wal_highwater: bool) -> Result<bool> {
         self.observability
             .flush
             .persist_runs_total
@@ -216,14 +216,13 @@ impl ChunkStorage {
                 return Ok((false, 0, 0, 0, 0));
             }
 
-            let wal_highwater = if include_wal_highwater {
-                self.wal
-                    .as_ref()
-                    .map(|wal| wal.current_highwater())
-                    .unwrap_or_default()
-            } else {
-                WalHighWatermark::default()
-            };
+            // If WAL is configured, always stamp segment manifests with the latest replay
+            // high-water mark before any WAL reset/truncate.
+            let wal_highwater = self
+                .wal
+                .as_ref()
+                .map(|wal| wal.current_highwater())
+                .unwrap_or_default();
 
             let (delta_chunks, delta_watermarks) = {
                 let persisted = self.persisted_chunk_watermarks.read();
@@ -497,6 +496,7 @@ impl ChunkStorage {
             self.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
             self.notify_compaction_thread();
             self.notify_flush_thread();
+            self.release_data_path_process_lock();
             if let Err(err) = self.join_background_threads() {
                 close_result = Err(err);
             }

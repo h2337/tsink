@@ -8,6 +8,7 @@ impl ChunkStorage {
         blob_compactor: Option<Compactor>,
         compaction_interval: Duration,
         observability: Arc<StorageObservabilityCounters>,
+        background_fail_fast: bool,
     ) -> Result<Option<std::thread::JoinHandle<()>>> {
         if numeric_compactor.is_none() && blob_compactor.is_none() {
             return Ok(None);
@@ -29,11 +30,29 @@ impl ChunkStorage {
                 }
 
                 let _compaction_guard = compaction_lock.lock();
-                let _ = Self::compact_compactors(
+                if observability
+                    .health
+                    .fail_fast_triggered
+                    .load(Ordering::SeqCst)
+                {
+                    break;
+                }
+                if let Err(err) = Self::compact_compactors(
                     numeric_compactor.as_ref(),
                     blob_compactor.as_ref(),
                     Some(observability.as_ref()),
-                );
+                ) {
+                    Self::record_background_worker_error(
+                        "compaction",
+                        &err,
+                        observability.as_ref(),
+                        background_fail_fast,
+                    );
+                    if background_fail_fast {
+                        lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
+                        break;
+                    }
+                }
             })?;
 
         Ok(Some(handle))
@@ -64,7 +83,26 @@ impl ChunkStorage {
                     _ => continue,
                 }
 
-                let _ = storage.flush_pipeline_once();
+                if storage
+                    .observability
+                    .health
+                    .fail_fast_triggered
+                    .load(Ordering::SeqCst)
+                {
+                    break;
+                }
+                if let Err(err) = storage.flush_pipeline_once() {
+                    Self::record_background_worker_error(
+                        "flush",
+                        &err,
+                        storage.observability.as_ref(),
+                        storage.background_fail_fast,
+                    );
+                    if storage.background_fail_fast {
+                        storage.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
+                        break;
+                    }
+                }
             })?;
 
         Ok(Some(handle))
@@ -91,6 +129,21 @@ impl ChunkStorage {
         if let Some(flush_thread) = self.flush_thread.lock().as_ref() {
             flush_thread.thread().unpark();
         }
+    }
+
+    fn record_background_worker_error(
+        worker: &'static str,
+        error: &TsinkError,
+        observability: &StorageObservabilityCounters,
+        fail_fast_enabled: bool,
+    ) {
+        observability.record_background_worker_error(worker, error, fail_fast_enabled);
+        tracing::error!(
+            worker = worker,
+            fail_fast_enabled,
+            error = %error,
+            "Background worker execution failed"
+        );
     }
 
     fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {

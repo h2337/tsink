@@ -25,6 +25,7 @@ fn list_metrics_remains_available_while_writer_waits_on_active_lock() {
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
+                background_fail_fast: false,
             },
         )
         .unwrap(),
@@ -92,6 +93,7 @@ fn writer_waiting_on_one_metric_shard_does_not_block_other_metric_shards() {
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
+                background_fail_fast: false,
             },
         )
         .unwrap(),
@@ -202,6 +204,7 @@ fn concurrent_lane_mismatch_does_not_log_failed_write_to_wal() {
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
+                background_fail_fast: false,
             },
         )
         .unwrap(),

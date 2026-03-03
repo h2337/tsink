@@ -3,6 +3,7 @@ use super::metrics::{
     WalObservabilityCounters,
 };
 use super::*;
+use crate::storage::StorageHealthSnapshot;
 use crate::{
     CompactionObservabilitySnapshot, FlushObservabilitySnapshot, QueryObservabilitySnapshot,
     WalObservabilitySnapshot,
@@ -209,6 +210,31 @@ impl ChunkStorage {
             flush: FlushObservabilitySnapshot::from(&self.observability.flush),
             compaction: CompactionObservabilitySnapshot::from(&self.observability.compaction),
             query: QueryObservabilitySnapshot::from(&self.observability.query),
+            health: StorageHealthSnapshot {
+                background_errors_total: self
+                    .observability
+                    .health
+                    .background_errors_total
+                    .load(Ordering::Relaxed),
+                degraded: self
+                    .observability
+                    .health
+                    .background_errors_total
+                    .load(Ordering::Relaxed)
+                    > 0,
+                fail_fast_enabled: self.background_fail_fast,
+                fail_fast_triggered: self
+                    .observability
+                    .health
+                    .fail_fast_triggered
+                    .load(Ordering::SeqCst),
+                last_background_error: self
+                    .observability
+                    .health
+                    .last_background_error
+                    .read()
+                    .clone(),
+            },
         }
     }
 }

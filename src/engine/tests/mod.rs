@@ -31,6 +31,7 @@ mod ingest_failures;
 mod persistence_background;
 mod persistence_recovery;
 mod persistence_segments;
+mod reliability;
 mod retention_policy;
 mod series_selection;
 

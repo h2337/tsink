@@ -492,7 +492,7 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        if self.persist_segment(false)? {
+        if self.persist_segment(self.wal.is_some())? {
             self.refresh_persisted_indexes_and_evict_flushed_sealed_chunks()?;
             used = self.memory_used_value();
         }

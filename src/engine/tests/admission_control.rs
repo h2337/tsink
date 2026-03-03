@@ -51,6 +51,7 @@ fn write_limiter_respects_configured_timeout() {
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
+            background_fail_fast: false,
         },
     )
     .unwrap();
@@ -90,6 +91,7 @@ fn admission_pressure_drain_times_out_when_another_writer_is_in_flight() {
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
+            background_fail_fast: false,
         },
     )
     .unwrap();
@@ -126,6 +128,7 @@ fn memory_pressure_drain_times_out_when_another_writer_is_in_flight() {
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
+            background_fail_fast: false,
         },
     )
     .unwrap();
@@ -172,6 +175,7 @@ fn close_blocks_until_in_flight_writer_releases_permit() {
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
+                background_fail_fast: false,
             },
         )
         .unwrap(),

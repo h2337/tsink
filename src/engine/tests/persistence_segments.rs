@@ -269,6 +269,46 @@ fn persist_segment_rolls_back_published_lane_when_other_lane_fails() {
 }
 
 #[test]
+fn persist_segment_stamps_wal_highwater_even_when_flag_is_false() {
+    let temp_dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "a")];
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions::default(),
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "wal_highwater_persist",
+            labels,
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+    storage.persist_segment(false).unwrap();
+
+    let segments = load_segments_for_level(&lane_path, 0).unwrap();
+    assert!(!segments.is_empty());
+    assert!(
+        segments
+            .iter()
+            .any(|segment| segment.manifest.wal_highwater > WalHighWatermark::default()),
+        "persisted segment must include WAL replay highwater when WAL is enabled"
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
 fn partition_window_rotates_chunks_before_reaching_chunk_cap() {
     let storage = ChunkStorage::new_with_data_path_and_options(
         8,
@@ -288,6 +328,7 @@ fn partition_window_rotates_chunks_before_reaching_chunk_cap() {
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
+            background_fail_fast: false,
         },
     )
     .unwrap();

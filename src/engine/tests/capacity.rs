@@ -22,6 +22,7 @@ fn memory_budget_spills_to_l0_and_preserves_query_results() {
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
+            background_fail_fast: false,
         },
     )
     .unwrap();
@@ -174,6 +175,7 @@ fn cardinality_limit_rejection_does_not_grow_string_dictionaries() {
         ChunkStorageOptions {
             cardinality_limit: 1,
             background_threads_enabled: false,
+            background_fail_fast: false,
             ..ChunkStorageOptions::default()
         },
     )

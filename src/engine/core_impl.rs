@@ -77,6 +77,7 @@ impl ChunkStorage {
                 blob_compactor.clone(),
                 options.compaction_interval,
                 Arc::clone(&observability),
+                options.background_fail_fast,
             )
         } else {
             Ok(None)
@@ -119,7 +120,9 @@ impl ChunkStorage {
             flush_visibility_lock: RwLock::new(()),
             compaction_thread: Mutex::new(compaction_thread?),
             flush_thread: Mutex::new(None),
+            data_path_process_lock: Mutex::new(None),
             observability,
+            background_fail_fast: options.background_fail_fast,
         })
     }
 
@@ -202,10 +205,29 @@ impl ChunkStorage {
     }
 
     pub(super) fn ensure_open(&self) -> Result<()> {
+        if self
+            .observability
+            .health
+            .fail_fast_triggered
+            .load(Ordering::SeqCst)
+        {
+            return Err(TsinkError::StorageShuttingDown);
+        }
         if self.lifecycle.load(Ordering::SeqCst) != STORAGE_OPEN {
             return Err(TsinkError::StorageClosed);
         }
         Ok(())
+    }
+
+    pub(super) fn install_data_path_process_lock(
+        &self,
+        data_path_process_lock: DataPathProcessLock,
+    ) {
+        *self.data_path_process_lock.lock() = Some(data_path_process_lock);
+    }
+
+    pub(super) fn release_data_path_process_lock(&self) {
+        self.data_path_process_lock.lock().take();
     }
 
     pub(super) fn update_max_observed_timestamp(&self, ts: i64) {

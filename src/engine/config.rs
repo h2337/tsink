@@ -13,6 +13,7 @@ pub(super) struct ChunkStorageOptions {
     pub(super) admission_poll_interval: Duration,
     pub(super) compaction_interval: Duration,
     pub(super) background_threads_enabled: bool,
+    pub(super) background_fail_fast: bool,
 }
 
 impl Default for ChunkStorageOptions {
@@ -36,6 +37,7 @@ impl Default for ChunkStorageOptions {
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
+            background_fail_fast: false,
         }
     }
 }
@@ -79,7 +81,7 @@ impl From<&StorageBuilder> for StoragePathLayout {
 impl From<&StorageBuilder> for ChunkStorageOptions {
     fn from(builder: &StorageBuilder) -> Self {
         let timestamp_precision = builder.timestamp_precision();
-        let wal_enabled = builder.wal_enabled();
+        let has_data_path = builder.data_path().is_some();
         Self {
             retention_window: duration_to_timestamp_units(builder.retention(), timestamp_precision),
             retention_enforced: builder.retention_enforced(),
@@ -95,7 +97,8 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
             wal_size_limit_bytes: builder.wal_size_limit_bytes().min(u64::MAX as usize) as u64,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
-            background_threads_enabled: wal_enabled,
+            background_threads_enabled: has_data_path,
+            background_fail_fast: builder.background_fail_fast(),
         }
     }
 }

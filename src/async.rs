@@ -475,6 +475,13 @@ impl AsyncStorageBuilder {
         self
     }
 
+    /// Enables fail-fast mode when background flush/compaction workers hit errors.
+    #[must_use]
+    pub fn with_background_fail_fast(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.with_background_fail_fast(enabled);
+        self
+    }
+
     /// Builds an async storage facade with dedicated workers.
     pub fn build(self) -> Result<AsyncStorage> {
         let storage = self.inner.build()?;

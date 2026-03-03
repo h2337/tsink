@@ -57,7 +57,7 @@ fn test_full_lifecycle() {
     assert_eq!(results[0].timestamp, 1000);
     assert_eq!(results[1].timestamp, 2000);
     let all = db.select_all("cpu.usage".into(), 0, 3000).unwrap();
-    assert_eq!(all.len(), 2); // two label sets
+    assert_eq!(all.len(), 2);
     let opts = UQueryOptions {
         labels: vec![ULabel {
             name: "host".into(),

@@ -13,7 +13,7 @@ use crate::engine::encoder::{EncodedChunk, Encoder};
 use crate::engine::segment::WalHighWatermark;
 use crate::engine::series::SeriesId;
 use crate::wal::WalSyncMode;
-use crate::{Label, Result, TsinkError};
+use crate::{Label, Result, TsinkError, Value};
 
 const WAL_FILE_NAME: &str = "wal.log";
 const WAL_SEGMENT_FILE_PREFIX: &str = "wal-";
@@ -56,6 +56,34 @@ impl SamplesBatchFrame {
         let (ts_payload, value_payload) = split_encoded_payload(&encoded.payload)?;
 
         let base_ts = points.first().map(|point| point.ts).ok_or_else(|| {
+            TsinkError::InvalidConfiguration("cannot WAL-encode empty batch".to_string())
+        })?;
+
+        let point_count = u16::try_from(points.len()).map_err(|_| {
+            TsinkError::InvalidConfiguration("WAL batch exceeds u16 point count".to_string())
+        })?;
+
+        Ok(Self {
+            series_id,
+            lane,
+            ts_codec: encoded.ts_codec,
+            value_codec: encoded.value_codec,
+            point_count,
+            base_ts,
+            ts_payload,
+            value_payload,
+        })
+    }
+
+    pub fn from_timestamp_value_refs(
+        series_id: SeriesId,
+        lane: ValueLane,
+        points: &[(i64, &Value)],
+    ) -> Result<Self> {
+        let encoded = Encoder::encode_timestamp_value_refs(points, lane)?;
+        let (ts_payload, value_payload) = split_encoded_payload(&encoded.payload)?;
+
+        let base_ts = points.first().map(|point| point.0).ok_or_else(|| {
             TsinkError::InvalidConfiguration("cannot WAL-encode empty batch".to_string())
         })?;
 
@@ -387,21 +415,46 @@ impl FramedWal {
     pub fn estimate_series_definition_frame_bytes(
         definition: &SeriesDefinitionFrame,
     ) -> Result<u64> {
-        let payload = encode_series_definition(definition)?;
-        Ok(FRAME_HEADER_LEN as u64 + payload.len() as u64)
+        let payload = Self::encode_series_definition_frame_payload(definition)?;
+        Ok(Self::frame_size_bytes_for_payload_len(payload.len()))
     }
 
     pub fn estimate_samples_frame_bytes(batches: &[SamplesBatchFrame]) -> Result<u64> {
         if batches.is_empty() {
             return Ok(0);
         }
-        let payload = encode_samples_payload(batches)?;
-        Ok(FRAME_HEADER_LEN as u64 + payload.len() as u64)
+        let payload = Self::encode_samples_frame_payload(batches)?;
+        Ok(Self::frame_size_bytes_for_payload_len(payload.len()))
+    }
+
+    pub fn frame_size_bytes_for_payload_len(payload_len: usize) -> u64 {
+        FRAME_HEADER_LEN as u64 + payload_len as u64
+    }
+
+    pub fn encode_series_definition_frame_payload(
+        definition: &SeriesDefinitionFrame,
+    ) -> Result<Vec<u8>> {
+        encode_series_definition(definition)
+    }
+
+    pub fn encode_samples_frame_payload(batches: &[SamplesBatchFrame]) -> Result<Vec<u8>> {
+        encode_samples_payload(batches)
+    }
+
+    pub fn append_series_definition_payload(&self, payload: &[u8]) -> Result<()> {
+        self.append_frame(FRAME_TYPE_SERIES_DEF, payload)
+    }
+
+    pub fn append_samples_payload(&self, payload: &[u8]) -> Result<()> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+        self.append_frame(FRAME_TYPE_SAMPLES, payload)
     }
 
     pub fn append_series_definition(&self, definition: &SeriesDefinitionFrame) -> Result<()> {
-        let payload = encode_series_definition(definition)?;
-        self.append_frame(FRAME_TYPE_SERIES_DEF, &payload)
+        let payload = Self::encode_series_definition_frame_payload(definition)?;
+        self.append_series_definition_payload(&payload)
     }
 
     pub fn append_samples(&self, batches: &[SamplesBatchFrame]) -> Result<()> {
@@ -409,8 +462,8 @@ impl FramedWal {
             return Ok(());
         }
 
-        let payload = encode_samples_payload(batches)?;
-        self.append_frame(FRAME_TYPE_SAMPLES, &payload)
+        let payload = Self::encode_samples_frame_payload(batches)?;
+        self.append_samples_payload(&payload)
     }
 
     pub fn replay_frames(&self) -> Result<Vec<ReplayFrame>> {

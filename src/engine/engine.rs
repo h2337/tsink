@@ -241,6 +241,7 @@ struct ActiveSeriesState {
     lane: ValueLane,
     point_cap: usize,
     builder: ChunkBuilder,
+    builder_value_heap_bytes: usize,
     partition_id: Option<i64>,
 }
 
@@ -251,8 +252,16 @@ impl ActiveSeriesState {
             lane,
             point_cap,
             builder: ChunkBuilder::new(series_id, lane, point_cap),
+            builder_value_heap_bytes: 0,
             partition_id: None,
         }
+    }
+
+    fn append_point(&mut self, ts: i64, value: Value) {
+        self.builder_value_heap_bytes = self
+            .builder_value_heap_bytes
+            .saturating_add(value_heap_bytes(&value));
+        self.builder.append(ts, value);
     }
 
     fn rotate_partition_if_needed(
@@ -307,6 +316,7 @@ impl ActiveSeriesState {
             &mut self.builder,
             ChunkBuilder::new(self.series_id, self.lane, self.point_cap),
         );
+        self.builder_value_heap_bytes = 0;
         let mut chunk = old_builder
             .finalize(
                 super::chunk::TimestampCodecId::DeltaVarint,
@@ -333,6 +343,19 @@ struct PendingPoint {
     lane: ValueLane,
     ts: i64,
     value: Value,
+}
+
+struct PendingNewSeriesPlan {
+    metric: String,
+    labels: Vec<Label>,
+}
+
+struct PreparedWalWrite {
+    encoded_series_definition_payloads: Vec<Vec<u8>>,
+    encoded_samples_payload: Option<Vec<u8>>,
+    encoded_bytes: u64,
+    sample_batch_count: usize,
+    sample_point_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -429,7 +452,9 @@ pub struct ChunkStorage {
     partition_window: i64,
     write_limiter: Semaphore,
     write_timeout: Duration,
+    memory_accounting_enabled: bool,
     memory_used_bytes: AtomicU64,
+    memory_used_bytes_by_shard: [AtomicU64; IN_MEMORY_SHARD_COUNT],
     memory_budget_bytes: AtomicU64,
     cardinality_limit: usize,
     wal_size_limit_bytes: u64,
@@ -549,7 +574,9 @@ impl ChunkStorage {
             partition_window: options.partition_window.max(1),
             write_limiter: Semaphore::new(options.max_writers.max(1)),
             write_timeout: options.write_timeout,
+            memory_accounting_enabled: options.memory_budget_bytes != u64::MAX,
             memory_used_bytes: AtomicU64::new(0),
+            memory_used_bytes_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
             memory_budget_bytes: AtomicU64::new(options.memory_budget_bytes),
             cardinality_limit: options.cardinality_limit,
             wal_size_limit_bytes: options.wal_size_limit_bytes,
@@ -861,9 +888,6 @@ impl ChunkStorage {
                 .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
             return Err(err);
         }
-        if self.memory_budget_value() != usize::MAX {
-            self.refresh_memory_usage();
-        }
         self.observability
             .flush
             .pipeline_success_total
@@ -961,66 +985,100 @@ impl ChunkStorage {
         self.cardinality_limit
     }
 
-    fn projected_new_series_count(registry: &SeriesRegistry, rows: &[Row]) -> Result<usize> {
-        let mut pending_new_series = HashSet::<RawSeriesKey>::new();
-
-        for row in rows {
-            validate_metric(row.metric())?;
-            validate_labels(row.labels())?;
-
-            if registry
-                .resolve_existing(row.metric(), row.labels())
-                .is_some()
-            {
-                continue;
-            }
-
-            pending_new_series.insert(RawSeriesKey::new(row.metric(), row.labels()));
-        }
-
-        Ok(pending_new_series.len())
-    }
-
     fn wal_size_limit_value(&self) -> u64 {
         self.wal_size_limit_bytes
     }
 
-    fn compute_memory_usage_bytes(&self) -> usize {
-        let active_total = self
-            .active_builders
-            .par_iter()
-            .map(|shard| {
-                let active = shard.read();
-                active.values().fold(0usize, |acc, state| {
-                    acc.saturating_add(Self::active_state_memory_usage_bytes(state))
-                })
-            })
-            .reduce(|| 0usize, |acc, bytes| acc.saturating_add(bytes));
+    fn add_memory_usage_bytes(&self, shard_idx: usize, bytes: usize) {
+        if !self.memory_accounting_enabled || bytes == 0 {
+            return;
+        }
 
-        let sealed_total = self
-            .sealed_chunks
-            .par_iter()
-            .map(|shard| {
-                let sealed = shard.read();
-                sealed.values().fold(0usize, |series_acc, chunks| {
-                    series_acc.saturating_add(chunks.values().fold(0usize, |chunk_acc, chunk| {
-                        chunk_acc.saturating_add(Self::chunk_memory_usage_bytes(chunk))
-                    }))
-                })
-            })
-            .reduce(|| 0usize, |acc, bytes| acc.saturating_add(bytes));
+        let increment = saturating_u64_from_usize(bytes);
+        self.memory_used_bytes_by_shard[shard_idx].fetch_add(increment, Ordering::AcqRel);
+        self.memory_used_bytes
+            .fetch_add(increment, Ordering::AcqRel);
+    }
+
+    fn sub_memory_usage_bytes(&self, shard_idx: usize, bytes: usize) {
+        if !self.memory_accounting_enabled || bytes == 0 {
+            return;
+        }
+
+        let decrement = saturating_u64_from_usize(bytes);
+        self.memory_used_bytes_by_shard[shard_idx].fetch_sub(decrement, Ordering::AcqRel);
+        self.memory_used_bytes
+            .fetch_sub(decrement, Ordering::AcqRel);
+    }
+
+    fn account_memory_delta_bytes(&self, shard_idx: usize, before: usize, after: usize) {
+        if !self.memory_accounting_enabled {
+            return;
+        }
+        if after >= before {
+            self.add_memory_usage_bytes(shard_idx, after.saturating_sub(before));
+        } else {
+            self.sub_memory_usage_bytes(shard_idx, before.saturating_sub(after));
+        }
+    }
+
+    fn account_memory_delta_from_totals(
+        &self,
+        shard_idx: usize,
+        added_bytes: usize,
+        removed_bytes: usize,
+    ) {
+        if !self.memory_accounting_enabled {
+            return;
+        }
+        if added_bytes >= removed_bytes {
+            self.add_memory_usage_bytes(shard_idx, added_bytes.saturating_sub(removed_bytes));
+        } else {
+            self.sub_memory_usage_bytes(shard_idx, removed_bytes.saturating_sub(added_bytes));
+        }
+    }
+
+    fn compute_shard_memory_usage_bytes(&self, shard_idx: usize) -> usize {
+        let active = self.active_builders[shard_idx].read();
+        let active_total = active.values().fold(0usize, |acc, state| {
+            acc.saturating_add(Self::active_state_memory_usage_bytes_reconciled(state))
+        });
+
+        let sealed = self.sealed_chunks[shard_idx].read();
+        let sealed_total = sealed.values().fold(0usize, |series_acc, chunks| {
+            series_acc.saturating_add(chunks.values().fold(0usize, |chunk_acc, chunk| {
+                chunk_acc.saturating_add(Self::chunk_memory_usage_bytes(chunk))
+            }))
+        });
 
         active_total.saturating_add(sealed_total)
     }
 
     fn refresh_memory_usage(&self) -> usize {
-        let used = self.compute_memory_usage_bytes();
+        let mut used = 0usize;
+        for shard_idx in 0..IN_MEMORY_SHARD_COUNT {
+            let shard_used = self.compute_shard_memory_usage_bytes(shard_idx);
+            self.memory_used_bytes_by_shard[shard_idx]
+                .store(saturating_u64_from_usize(shard_used), Ordering::Release);
+            used = used.saturating_add(shard_used);
+        }
         self.memory_used_bytes
             .store(used.min(u64::MAX as usize) as u64, Ordering::Release);
         used
     }
 
     fn active_state_memory_usage_bytes(state: &ActiveSeriesState) -> usize {
+        std::mem::size_of::<ActiveSeriesState>()
+            .saturating_add(
+                state
+                    .builder
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ChunkPoint>()),
+            )
+            .saturating_add(state.builder_value_heap_bytes)
+    }
+
+    fn active_state_memory_usage_bytes_reconciled(state: &ActiveSeriesState) -> usize {
         let mut bytes = std::mem::size_of::<ActiveSeriesState>().saturating_add(
             state
                 .builder
@@ -1082,23 +1140,45 @@ impl ChunkStorage {
             .saturating_add(active_state_bytes)
     }
 
-    fn estimate_write_wal_growth_bytes(
+    fn prepare_wal_write(
         &self,
         new_series_defs: &[SeriesDefinitionFrame],
-        batches: &[SamplesBatchFrame],
-    ) -> Result<u64> {
+        points: &[PendingPoint],
+        grouped: &BTreeMap<SeriesId, (ValueLane, Vec<usize>)>,
+    ) -> Result<Option<PreparedWalWrite>> {
         let Some(_wal) = &self.wal else {
-            return Ok(0);
+            return Ok(None);
         };
 
-        let mut bytes = 0u64;
+        let mut encoded_series_definition_payloads = Vec::with_capacity(new_series_defs.len());
+        let mut encoded_bytes = 0u64;
         for definition in new_series_defs {
-            bytes = bytes.saturating_add(FramedWal::estimate_series_definition_frame_bytes(
-                definition,
-            )?);
+            let payload = FramedWal::encode_series_definition_frame_payload(definition)?;
+            encoded_bytes = encoded_bytes
+                .saturating_add(FramedWal::frame_size_bytes_for_payload_len(payload.len()));
+            encoded_series_definition_payloads.push(payload);
         }
-        bytes = bytes.saturating_add(FramedWal::estimate_samples_frame_bytes(batches)?);
-        Ok(bytes)
+
+        let mut encoded_samples_payload = None;
+        let mut sample_batch_count = 0usize;
+        let mut sample_point_count = 0usize;
+        if !grouped.is_empty() {
+            let batches = Self::encode_wal_batches(points, grouped)?;
+            sample_batch_count = batches.len();
+            sample_point_count = batches.iter().map(|batch| batch.point_count as usize).sum();
+            let payload = FramedWal::encode_samples_frame_payload(&batches)?;
+            encoded_bytes = encoded_bytes
+                .saturating_add(FramedWal::frame_size_bytes_for_payload_len(payload.len()));
+            encoded_samples_payload = Some(payload);
+        }
+
+        Ok(Some(PreparedWalWrite {
+            encoded_series_definition_payloads,
+            encoded_samples_payload,
+            encoded_bytes,
+            sample_batch_count,
+            sample_point_count,
+        }))
     }
 
     fn memory_budget_shortfall(&self, estimated_growth_bytes: usize) -> Option<(usize, usize)> {
@@ -1107,7 +1187,7 @@ impl ChunkStorage {
             return None;
         }
 
-        let used = self.refresh_memory_usage();
+        let used = self.memory_used_value();
         let required = used.saturating_add(estimated_growth_bytes);
         (required > budget).then_some((budget, required))
     }
@@ -1221,9 +1301,25 @@ impl ChunkStorage {
     }
 
     fn prune_empty_active_series(&self) {
-        for shard in &self.active_builders {
+        if !self.memory_accounting_enabled {
+            for shard in &self.active_builders {
+                shard.write().retain(|_, state| !state.builder.is_empty());
+            }
+            return;
+        }
+
+        for (shard_idx, shard) in self.active_builders.iter().enumerate() {
             let mut active = shard.write();
-            active.retain(|_, state| !state.builder.is_empty());
+            let mut removed_bytes = 0usize;
+            active.retain(|_, state| {
+                let keep = !state.builder.is_empty();
+                if !keep {
+                    removed_bytes =
+                        removed_bytes.saturating_add(Self::active_state_memory_usage_bytes(state));
+                }
+                keep
+            });
+            self.sub_memory_usage_bytes(shard_idx, removed_bytes);
         }
     }
 
@@ -1422,9 +1518,15 @@ impl ChunkStorage {
         let Some(chunks) = sealed.get_mut(&series_id) else {
             return false;
         };
-        let removed = chunks.remove(&key).is_some();
+        let removed_chunk = chunks.remove(&key);
         if chunks.is_empty() {
             sealed.remove(&series_id);
+        }
+        let removed = removed_chunk.is_some();
+        if self.memory_accounting_enabled {
+            if let Some(chunk) = removed_chunk.as_ref() {
+                self.sub_memory_usage_bytes(shard_idx, Self::chunk_memory_usage_bytes(chunk));
+            }
         }
 
         if removed {
@@ -1442,8 +1544,9 @@ impl ChunkStorage {
         let persisted_index = self.persisted_index.read();
         let mut evicted = 0usize;
 
-        for shard in &self.sealed_chunks {
+        for (shard_idx, shard) in self.sealed_chunks.iter().enumerate() {
             let mut sealed = shard.write();
+            let mut removed_bytes = 0usize;
             sealed.retain(|series_id, chunks| {
                 let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
                 let persisted_chunks = persisted_index
@@ -1460,12 +1563,19 @@ impl ChunkStorage {
                         );
                     if remove {
                         evicted = evicted.saturating_add(1);
+                        if self.memory_accounting_enabled {
+                            removed_bytes =
+                                removed_bytes.saturating_add(Self::chunk_memory_usage_bytes(chunk));
+                        }
                     }
                     !remove
                 });
 
                 !chunks.is_empty()
             });
+            if self.memory_accounting_enabled {
+                self.sub_memory_usage_bytes(shard_idx, removed_bytes);
+            }
         }
 
         evicted
@@ -1478,7 +1588,6 @@ impl ChunkStorage {
         }
 
         if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
-            // In-memory-only mode cannot spill to L0 segments.
             return Ok(());
         }
 
@@ -1493,12 +1602,11 @@ impl ChunkStorage {
         }
 
         if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
-            // In-memory-only mode cannot spill to L0 segments.
             return Ok(());
         }
 
         let _backpressure_guard = self.memory_backpressure_lock.lock();
-        let used = self.refresh_memory_usage();
+        let used = self.memory_used_value();
         if used <= budget {
             return Ok(());
         }
@@ -1509,38 +1617,54 @@ impl ChunkStorage {
     }
 
     fn enforce_memory_budget_locked(&self, budget: usize) -> Result<()> {
-        let mut used = self.refresh_memory_usage();
+        let mut used = self.memory_used_value();
         if used <= budget {
             return Ok(());
         }
 
         self.flush_all_active()?;
         self.prune_empty_active_series();
-        used = self.refresh_memory_usage();
+        used = self.memory_used_value();
         if used <= budget {
             return Ok(());
         }
 
         if self.persist_segment(false)? {
             self.refresh_persisted_indexes_and_evict_flushed_sealed_chunks()?;
-            used = self.refresh_memory_usage();
+            used = self.memory_used_value();
         }
 
         while used > budget {
             if !self.evict_oldest_persisted_sealed_chunk() {
                 break;
             }
-            used = self.refresh_memory_usage();
+            used = self.memory_used_value();
         }
 
         Ok(())
     }
 
     fn append_sealed_chunk(&self, series_id: SeriesId, chunk: Chunk) {
+        let shard_idx = Self::series_shard_idx(series_id);
+        let account_memory = self.memory_accounting_enabled;
+        let chunk_bytes = if account_memory {
+            Self::chunk_memory_usage_bytes(&chunk)
+        } else {
+            0
+        };
         let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
         let key = SealedChunkKey::from_chunk(&chunk, sequence);
         let mut sealed = self.sealed_shard(series_id).write();
-        sealed.entry(series_id).or_default().insert(key, chunk);
+        let replaced = sealed.entry(series_id).or_default().insert(key, chunk);
+        if account_memory {
+            self.add_memory_usage_bytes(shard_idx, chunk_bytes);
+            if let Some(previous_chunk) = replaced.as_ref() {
+                self.sub_memory_usage_bytes(
+                    shard_idx,
+                    Self::chunk_memory_usage_bytes(previous_chunk),
+                );
+            }
+        }
     }
 
     fn flush_all_active(&self) -> Result<()> {
@@ -1554,20 +1678,62 @@ impl ChunkStorage {
         let mut flushed_points = 0usize;
 
         let result = (|| -> Result<()> {
-            for shard in &self.active_builders {
+            let account_memory = self.memory_accounting_enabled;
+            for (shard_idx, shard) in self.active_builders.iter().enumerate() {
                 let mut active = shard.write();
+                let mut active_added_bytes = 0usize;
+                let mut active_removed_bytes = 0usize;
+                let mut sealed_added_bytes = 0usize;
+                let mut sealed_removed_bytes = 0usize;
                 for (series_id, state) in active.iter_mut() {
+                    let state_bytes_before = if account_memory {
+                        Self::active_state_memory_usage_bytes(state)
+                    } else {
+                        0
+                    };
                     let Some(chunk) = state.flush_partial()? else {
                         continue;
                     };
+                    if account_memory {
+                        let state_bytes_after = Self::active_state_memory_usage_bytes(state);
+                        if state_bytes_after >= state_bytes_before {
+                            active_added_bytes = active_added_bytes.saturating_add(
+                                state_bytes_after.saturating_sub(state_bytes_before),
+                            );
+                        } else {
+                            active_removed_bytes = active_removed_bytes.saturating_add(
+                                state_bytes_before.saturating_sub(state_bytes_after),
+                            );
+                        }
+                    }
+
                     flushed_series = flushed_series.saturating_add(1);
                     flushed_chunks = flushed_chunks.saturating_add(1);
                     flushed_points =
                         flushed_points.saturating_add(chunk.header.point_count as usize);
+                    let chunk_bytes = if account_memory {
+                        Self::chunk_memory_usage_bytes(&chunk)
+                    } else {
+                        0
+                    };
                     let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
                     let key = SealedChunkKey::from_chunk(&chunk, sequence);
                     let mut sealed = self.sealed_shard(*series_id).write();
-                    sealed.entry(*series_id).or_default().insert(key, chunk);
+                    let replaced = sealed.entry(*series_id).or_default().insert(key, chunk);
+                    if account_memory {
+                        sealed_added_bytes = sealed_added_bytes.saturating_add(chunk_bytes);
+                        if let Some(previous_chunk) = replaced.as_ref() {
+                            sealed_removed_bytes = sealed_removed_bytes
+                                .saturating_add(Self::chunk_memory_usage_bytes(previous_chunk));
+                        }
+                    }
+                }
+                if account_memory {
+                    self.account_memory_delta_from_totals(
+                        shard_idx,
+                        active_added_bytes.saturating_add(sealed_added_bytes),
+                        active_removed_bytes.saturating_add(sealed_removed_bytes),
+                    );
                 }
             }
 
@@ -2275,10 +2441,10 @@ impl ChunkStorage {
 
         let mut shard_guards = Vec::with_capacity(lanes_by_shard.len());
         for (shard_idx, entries) in lanes_by_shard {
-            shard_guards.push((entries, self.active_builders[shard_idx].write()));
+            shard_guards.push((shard_idx, entries, self.active_builders[shard_idx].write()));
         }
 
-        for (entries, active) in &shard_guards {
+        for (_, entries, active) in &shard_guards {
             for (series_id, lane) in entries {
                 if let Some(state) = active.get(series_id) {
                     if state.lane != *lane {
@@ -2292,15 +2458,20 @@ impl ChunkStorage {
         }
 
         let mut reserved = Vec::new();
-        for (entries, active) in &mut shard_guards {
+        let account_memory = self.memory_accounting_enabled;
+        for (shard_idx, entries, active) in &mut shard_guards {
             for (series_id, lane) in entries {
                 if active.contains_key(series_id) {
                     continue;
                 }
-                active.insert(
-                    *series_id,
-                    ActiveSeriesState::new(*series_id, *lane, self.chunk_point_cap),
-                );
+                let state = ActiveSeriesState::new(*series_id, *lane, self.chunk_point_cap);
+                if account_memory {
+                    self.add_memory_usage_bytes(
+                        *shard_idx,
+                        Self::active_state_memory_usage_bytes(&state),
+                    );
+                }
+                active.insert(*series_id, state);
                 reserved.push(*series_id);
             }
         }
@@ -2326,10 +2497,16 @@ impl ChunkStorage {
             for series_id in shard_series_ids {
                 let should_remove = active
                     .get(&series_id)
-                    .map(|state| state.builder.is_empty())
-                    .unwrap_or(false);
+                    .is_some_and(|state| state.builder.is_empty());
                 if should_remove {
-                    active.remove(&series_id);
+                    if let Some(removed) = active.remove(&series_id) {
+                        if self.memory_accounting_enabled {
+                            self.sub_memory_usage_bytes(
+                                shard_idx,
+                                Self::active_state_memory_usage_bytes(&removed),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2342,8 +2519,18 @@ impl ChunkStorage {
         ts: i64,
         value: Value,
     ) -> Result<()> {
+        let shard_idx = Self::series_shard_idx(series_id);
+        let account_memory = self.memory_accounting_enabled;
         let finalized = {
             let mut active = self.active_shard(series_id).write();
+            let before = if account_memory {
+                active
+                    .get(&series_id)
+                    .map(Self::active_state_memory_usage_bytes)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             let state = active
                 .entry(series_id)
                 .or_insert_with(|| ActiveSeriesState::new(series_id, lane, self.chunk_point_cap));
@@ -2359,9 +2546,13 @@ impl ChunkStorage {
             if let Some(chunk) = state.rotate_partition_if_needed(ts, self.partition_window)? {
                 finalized.push(chunk);
             }
-            state.builder.append(ts, value);
+            state.append_point(ts, value);
             if let Some(chunk) = state.rotate_full_if_needed()? {
                 finalized.push(chunk);
+            }
+            if account_memory {
+                let after = Self::active_state_memory_usage_bytes(state);
+                self.account_memory_delta_bytes(shard_idx, before, after);
             }
             finalized
         };
@@ -2406,12 +2597,23 @@ impl ChunkStorage {
             return Ok(());
         }
 
+        let account_memory = self.memory_accounting_enabled;
         let mut finalized = Vec::<(SeriesId, Chunk)>::new();
         let mut materialized_series_ids = BTreeSet::new();
+        let mut active_added_bytes = 0usize;
+        let mut active_removed_bytes = 0usize;
         {
             let mut active = self.active_builders[shard_idx].write();
 
             for point in shard_points {
+                let state_bytes_before = if account_memory {
+                    active
+                        .get(&point.series_id)
+                        .map(Self::active_state_memory_usage_bytes)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 let state = active.entry(point.series_id).or_insert_with(|| {
                     ActiveSeriesState::new(point.series_id, point.lane, self.chunk_point_cap)
                 });
@@ -2430,13 +2632,31 @@ impl ChunkStorage {
                     finalized.push((point.series_id, chunk));
                 }
 
-                state.builder.append(point.ts, point.value);
+                state.append_point(point.ts, point.value);
                 self.update_max_observed_timestamp(point.ts);
 
                 if let Some(chunk) = state.rotate_full_if_needed()? {
                     finalized.push((point.series_id, chunk));
                 }
+
+                if account_memory {
+                    let state_bytes_after = Self::active_state_memory_usage_bytes(state);
+                    if state_bytes_after >= state_bytes_before {
+                        active_added_bytes = active_added_bytes
+                            .saturating_add(state_bytes_after.saturating_sub(state_bytes_before));
+                    } else {
+                        active_removed_bytes = active_removed_bytes
+                            .saturating_add(state_bytes_before.saturating_sub(state_bytes_after));
+                    }
+                }
             }
+        }
+        if account_memory {
+            self.account_memory_delta_from_totals(
+                shard_idx,
+                active_added_bytes,
+                active_removed_bytes,
+            );
         }
 
         self.mark_materialized_series_ids(materialized_series_ids);
@@ -2446,10 +2666,31 @@ impl ChunkStorage {
         }
 
         let mut sealed = self.sealed_chunks[shard_idx].write();
+        let mut sealed_added_bytes = 0usize;
+        let mut sealed_removed_bytes = 0usize;
         for (series_id, chunk) in finalized {
+            let chunk_bytes = if account_memory {
+                Self::chunk_memory_usage_bytes(&chunk)
+            } else {
+                0
+            };
             let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
             let key = SealedChunkKey::from_chunk(&chunk, sequence);
-            sealed.entry(series_id).or_default().insert(key, chunk);
+            let replaced = sealed.entry(series_id).or_default().insert(key, chunk);
+            if account_memory {
+                sealed_added_bytes = sealed_added_bytes.saturating_add(chunk_bytes);
+                if let Some(previous_chunk) = replaced.as_ref() {
+                    sealed_removed_bytes = sealed_removed_bytes
+                        .saturating_add(Self::chunk_memory_usage_bytes(previous_chunk));
+                }
+            }
+        }
+        if account_memory {
+            self.account_memory_delta_from_totals(
+                shard_idx,
+                sealed_added_bytes,
+                sealed_removed_bytes,
+            );
         }
 
         Ok(())
@@ -2523,19 +2764,16 @@ impl ChunkStorage {
     ) -> Result<Vec<SamplesBatchFrame>> {
         let mut batches = Vec::with_capacity(grouped.len());
         for (series_id, (lane, indexes)) in grouped {
-            let mut chunk_points = Vec::with_capacity(indexes.len());
+            let mut point_refs = Vec::with_capacity(indexes.len());
             for idx in indexes {
                 let point = &points[*idx];
-                chunk_points.push(ChunkPoint {
-                    ts: point.ts,
-                    value: point.value.clone(),
-                });
+                point_refs.push((point.ts, &point.value));
             }
 
-            batches.push(SamplesBatchFrame::from_points(
+            batches.push(SamplesBatchFrame::from_timestamp_value_refs(
                 *series_id,
                 *lane,
-                &chunk_points,
+                &point_refs,
             )?);
         }
 
@@ -3029,38 +3267,83 @@ impl Storage for ChunkStorage {
 
             if let Err(err) = (|| -> Result<()> {
                 let cardinality_limit = self.cardinality_limit_value();
-                if cardinality_limit != usize::MAX {
-                    let current = registry.series_count();
-                    let requested = Self::projected_new_series_count(&registry, rows)?;
-                    if requested > 0 && current.saturating_add(requested) > cardinality_limit {
-                        return Err(TsinkError::CardinalityLimitExceeded {
-                            limit: cardinality_limit,
-                            current,
-                            requested,
-                        });
-                    }
-                }
+                let current = registry.series_count();
+                let mut pending_new_series = HashMap::<RawSeriesKey, usize>::new();
+                let mut pending_new_series_plans = Vec::<PendingNewSeriesPlan>::new();
+                let mut pending_new_point_refs = Vec::<(usize, usize)>::new();
 
                 for row in rows {
+                    validate_metric(row.metric())?;
+                    validate_labels(row.labels())?;
+
                     let data_point = row.data_point();
                     let lane = lane_for_value(&data_point.value);
-                    let resolution = registry.resolve_or_insert(row.metric(), row.labels())?;
 
-                    if resolution.created {
-                        created_series.push(resolution.clone());
-                        new_series_defs.push(SeriesDefinitionFrame {
+                    if let Some(resolution) = registry.resolve_existing(row.metric(), row.labels())
+                    {
+                        pending_points.push(PendingPoint {
                             series_id: resolution.series_id,
+                            lane,
+                            ts: data_point.timestamp,
+                            value: data_point.value.clone(),
+                        });
+                        continue;
+                    }
+
+                    let key = RawSeriesKey::new(row.metric(), row.labels());
+                    let plan_idx = if let Some(existing) = pending_new_series.get(&key) {
+                        *existing
+                    } else {
+                        let next = pending_new_series_plans.len();
+                        pending_new_series.insert(key, next);
+                        pending_new_series_plans.push(PendingNewSeriesPlan {
                             metric: row.metric().to_string(),
                             labels: row.labels().to_vec(),
                         });
-                    }
+                        next
+                    };
 
+                    let point_idx = pending_points.len();
                     pending_points.push(PendingPoint {
-                        series_id: resolution.series_id,
+                        series_id: 0,
                         lane,
                         ts: data_point.timestamp,
                         value: data_point.value.clone(),
                     });
+                    pending_new_point_refs.push((point_idx, plan_idx));
+                }
+
+                let requested = pending_new_series_plans.len();
+                if cardinality_limit != usize::MAX
+                    && requested > 0
+                    && current.saturating_add(requested) > cardinality_limit
+                {
+                    return Err(TsinkError::CardinalityLimitExceeded {
+                        limit: cardinality_limit,
+                        current,
+                        requested,
+                    });
+                }
+
+                if requested > 0 {
+                    let mut pending_plan_series_ids = vec![0; requested];
+                    for (plan_idx, plan) in pending_new_series_plans.into_iter().enumerate() {
+                        let resolution = registry.resolve_or_insert(&plan.metric, &plan.labels)?;
+                        pending_plan_series_ids[plan_idx] = resolution.series_id;
+
+                        if resolution.created {
+                            created_series.push(resolution.clone());
+                            new_series_defs.push(SeriesDefinitionFrame {
+                                series_id: resolution.series_id,
+                                metric: plan.metric,
+                                labels: plan.labels,
+                            });
+                        }
+                    }
+
+                    for (point_idx, plan_idx) in pending_new_point_refs {
+                        pending_points[point_idx].series_id = pending_plan_series_ids[plan_idx];
+                    }
                 }
 
                 Ok(())
@@ -3079,23 +3362,20 @@ impl Storage for ChunkStorage {
             let grouped_points = Self::group_pending_point_indexes_by_series(&pending_points)?;
             self.validate_pending_point_families(&pending_points, &grouped_points)?;
             self.validate_points_against_retention(&pending_points)?;
-            let wal_batches = if self.wal.is_some() {
-                Some(Self::encode_wal_batches(&pending_points, &grouped_points)?)
-            } else {
-                None
-            };
+            let prepared_wal =
+                self.prepare_wal_write(&new_series_defs, &pending_points, &grouped_points)?;
             let estimated_memory_growth =
                 self.estimate_write_memory_growth_bytes(&pending_points, &grouped_points);
-            let estimated_wal_growth = self.estimate_write_wal_growth_bytes(
-                &new_series_defs,
-                wal_batches.as_deref().unwrap_or(&[]),
-            )?;
+            let estimated_wal_growth = prepared_wal
+                .as_ref()
+                .map(|prepared| prepared.encoded_bytes)
+                .unwrap_or(0);
             self.enforce_admission_controls(estimated_memory_growth, estimated_wal_growth)?;
             reserved_series = self.reserve_series_lanes(&pending_points)?;
 
-            if let (Some(wal), Some(batches)) = (&self.wal, wal_batches.as_deref()) {
-                for definition in &new_series_defs {
-                    if let Err(err) = wal.append_series_definition(definition) {
+            if let (Some(wal), Some(prepared_wal)) = (&self.wal, prepared_wal.as_ref()) {
+                for payload in &prepared_wal.encoded_series_definition_payloads {
+                    if let Err(err) = wal.append_series_definition_payload(payload) {
                         self.observability
                             .wal
                             .append_errors_total
@@ -3104,37 +3384,40 @@ impl Storage for ChunkStorage {
                     }
                 }
 
-                if let Err(err) = wal.append_samples(batches) {
-                    self.observability
-                        .wal
-                        .append_errors_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
+                if let Some(samples_payload) = prepared_wal.encoded_samples_payload.as_deref() {
+                    if let Err(err) = wal.append_samples_payload(samples_payload) {
+                        self.observability
+                            .wal
+                            .append_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(err);
+                    }
                 }
 
-                let batch_points = batches
-                    .iter()
-                    .map(|batch| batch.point_count as usize)
-                    .sum::<usize>();
                 self.observability
                     .wal
                     .append_series_definitions_total
                     .fetch_add(
-                        saturating_u64_from_usize(new_series_defs.len()),
+                        saturating_u64_from_usize(
+                            prepared_wal.encoded_series_definition_payloads.len(),
+                        ),
                         Ordering::Relaxed,
                     );
                 self.observability
                     .wal
                     .append_sample_batches_total
-                    .fetch_add(saturating_u64_from_usize(batches.len()), Ordering::Relaxed);
-                self.observability
-                    .wal
-                    .append_points_total
-                    .fetch_add(saturating_u64_from_usize(batch_points), Ordering::Relaxed);
+                    .fetch_add(
+                        saturating_u64_from_usize(prepared_wal.sample_batch_count),
+                        Ordering::Relaxed,
+                    );
+                self.observability.wal.append_points_total.fetch_add(
+                    saturating_u64_from_usize(prepared_wal.sample_point_count),
+                    Ordering::Relaxed,
+                );
                 self.observability
                     .wal
                     .append_bytes_total
-                    .fetch_add(estimated_wal_growth, Ordering::Relaxed);
+                    .fetch_add(prepared_wal.encoded_bytes, Ordering::Relaxed);
             }
             self.ingest_pending_points(std::mem::take(&mut pending_points))?;
             ingest_committed = true;
@@ -3149,15 +3432,11 @@ impl Storage for ChunkStorage {
             } else {
                 self.notify_flush_thread();
             }
-            if self.memory_budget_value() != usize::MAX {
-                self.refresh_memory_usage();
-            }
             return Err(err);
         }
 
         if self.memory_budget_value() != usize::MAX {
             drop(write_permit);
-            self.refresh_memory_usage();
             self.enforce_memory_budget_if_needed()?;
         }
 
@@ -3467,10 +3746,11 @@ impl Storage for ChunkStorage {
     }
 
     fn memory_used(&self) -> usize {
-        let used = self.compute_memory_usage_bytes();
-        self.memory_used_bytes
-            .store(used.min(u64::MAX as usize) as u64, Ordering::Release);
-        used
+        if self.memory_accounting_enabled {
+            self.memory_used_value()
+        } else {
+            self.refresh_memory_usage()
+        }
     }
 
     fn memory_budget(&self) -> usize {

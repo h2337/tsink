@@ -9,16 +9,16 @@ use std::io;
 
 /// Maximum map size for different architectures
 #[cfg(target_arch = "x86")]
-pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF; // 2GB for 32-bit
+pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF;
 
 #[cfg(target_arch = "arm")]
-pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF; // 2GB for ARM
+pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF;
 
 #[cfg(target_arch = "x86_64")]
-pub const MAX_MAP_SIZE: usize = usize::MAX; // No practical limit on 64-bit
+pub const MAX_MAP_SIZE: usize = usize::MAX;
 
 #[cfg(target_arch = "aarch64")]
-pub const MAX_MAP_SIZE: usize = usize::MAX; // No practical limit on ARM64
+pub const MAX_MAP_SIZE: usize = usize::MAX;
 
 #[cfg(not(any(
     target_arch = "x86",
@@ -26,7 +26,7 @@ pub const MAX_MAP_SIZE: usize = usize::MAX; // No practical limit on ARM64
     target_arch = "x86_64",
     target_arch = "aarch64"
 )))]
-pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF; // Default to 2GB for unknown architectures
+pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF;
 
 /// Platform-specific memory mapping
 pub struct PlatformMmap {
@@ -48,7 +48,6 @@ impl PlatformMmap {
 
     #[inline]
     fn create_map(file: File, length: usize) -> io::Result<Self> {
-        // Only enforce the configured ceiling on platforms where MAX_MAP_SIZE is not unbounded.
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             if length > MAX_MAP_SIZE {

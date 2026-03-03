@@ -88,6 +88,33 @@ impl Encoder {
         Self::encode_points(points, lane)
     }
 
+    pub fn encode_timestamp_value_refs(
+        points: &[(i64, &Value)],
+        lane: ValueLane,
+    ) -> Result<EncodedChunk> {
+        #[derive(Clone, Copy)]
+        struct TimestampValueRef<'a> {
+            ts: i64,
+            value: &'a Value,
+        }
+
+        impl EncodablePoint for TimestampValueRef<'_> {
+            fn ts(&self) -> i64 {
+                self.ts
+            }
+
+            fn value(&self) -> &Value {
+                self.value
+            }
+        }
+
+        let refs = points
+            .iter()
+            .map(|(ts, value)| TimestampValueRef { ts: *ts, value })
+            .collect::<Vec<_>>();
+        Self::encode_points(&refs, lane)
+    }
+
     pub fn validate_chunk_points(points: &[ChunkPoint], lane: ValueLane) -> Result<()> {
         infer_value_family(points, lane)?;
         Ok(())

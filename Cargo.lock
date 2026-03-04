@@ -1670,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "tsink"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "tsink-server"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "prost",
  "regex",
@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "tsink-uniffi"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "parking_lot",
  "tempfile",

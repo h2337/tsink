@@ -13,6 +13,8 @@
 `tsink` is a lightweight, in-process time-series database engine for Rust applications.
 It stores time-series data in compressed chunks, persists immutable segment files to disk, and can replay a write-ahead log (WAL) after crashes — all without requiring an external server.
 
+> `0.9.0` upgrade note: persistent on-disk data from `0.8.x` is not wire-compatible with `0.9.0` (`STORAGE_FORMAT_VERSION=2` with disk-backed series index + roaring postings).
+
 ## Features
 
 - **Embedded API** — no external server, network protocol, or daemon required.
@@ -20,15 +22,17 @@ It stores time-series data in compressed chunks, persists immutable segment file
 - **Multi-series model** — series identity is metric name + exact label set.
 - **Typed values** — `f64`, `i64`, `u64`, `bool`, `bytes`, and `string`.
 - **Rich queries** — downsampling, aggregation (12 built-in functions), pagination, and custom bytes aggregation via the `Codec`/`Aggregator` traits.
-- **Disk persistence** — immutable segment files with a crash-safe commit protocol.
-- **WAL durability** — selectable sync mode (`Periodic` or `PerAppend`) with idempotent replay on recovery.
+- **Disk persistence (v2)** — immutable segment files + disk-backed global `series_index.bin` and roaring-bitmaps postings.
+- **WAL durability** — selectable sync mode (`Periodic` or `PerAppend`) and replay policy (`Salvage` default or `Strict`).
 - **Atomic snapshot/restore** — create segment-consistent, WAL-aware backups and restore them atomically.
 - **Out-of-order writes** — data is returned sorted by timestamp regardless of insertion order.
 - **Concurrent writers** — multiple threads can insert simultaneously with sharded internal locking.
 - **Optional PromQL engine** — instant and range queries with 20+ built-in functions; enable with the `promql` Cargo feature.
 - **LSM-style compaction** — tiered L0 → L1 → L2 segment compaction reduces read amplification.
-- **Gorilla compression** — Gorilla XOR encoding for floats, delta-of-delta for timestamps, and per-type codecs for other value types.
-- **cgroup-aware defaults** — worker thread counts and memory limits respect container CPU/memory quotas.
+- **Adaptive compression** — Gorilla/delta codecs plus payload-level zstd compression when beneficial.
+- **Observability snapshots** — structured WAL/flush/compaction/query counters and health state via `observability_snapshot()`.
+- **Single-process safety** — per-`data_path` lock file (`.tsink.lock`) blocks concurrent writers in multiple processes.
+- **cgroup-aware defaults** — worker thread defaults respect container CPU quotas.
 - **Resource limits** — configurable memory budget, series cardinality cap, and WAL size limit with admission backpressure.
 
 ## Table of Contents
@@ -44,6 +48,7 @@ It stores time-series data in compressed chunks, persists immutable segment file
 - [Label Constraints](#label-constraints)
 - [PromQL Engine](#promql-engine)
 - [Persistence and WAL](#persistence-and-wal)
+- [Observability](#observability)
 - [Snapshots and Restore](#snapshots-and-restore)
 - [On-Disk Layout](#on-disk-layout)
 - [Compression and Encoding](#compression-and-encoding)
@@ -66,21 +71,21 @@ It stores time-series data in compressed chunks, persists immutable segment file
 
 ```toml
 [dependencies]
-tsink = "0.8"
+tsink = "0.9"
 ```
 
 Enable PromQL support:
 
 ```toml
 [dependencies]
-tsink = { version = "0.8", features = ["promql"] }
+tsink = { version = "0.9", features = ["promql"] }
 ```
 
 Enable async storage facade (dedicated worker threads, runtime-agnostic futures):
 
 ```toml
 [dependencies]
-tsink = { version = "0.8", features = ["async-storage"] }
+tsink = { version = "0.9", features = ["async-storage"] }
 ```
 
 ## Quick Start
@@ -146,12 +151,15 @@ storage.close().await?;
 # }
 ```
 
+`AsyncStorageBuilder` forwards all core `StorageBuilder` configuration, including WAL replay mode (`with_wal_replay_mode`) and background fail-fast (`with_background_fail_fast`).
+
 `AsyncStorage` also provides synchronous accessors for introspection:
 
 | Method | Description |
 |---|---|
 | `memory_used()` | Current in-memory usage in bytes. |
 | `memory_budget()` | Configured memory budget. |
+| `snapshot(path).await` | Create an atomic snapshot using the async write worker. |
 | `inner()` | Access the underlying `Arc<dyn Storage>`. |
 | `into_inner(self)` | Unwrap the underlying storage handle. |
 
@@ -172,6 +180,7 @@ cargo run -p tsink-server -- server --listen 127.0.0.1:9201 --data-path ./tsink-
 | Flag | Default | Description |
 |---|---|---|
 | `--listen <ADDR>` | `127.0.0.1:9201` | Bind address. |
+| `-V, --version` | — | Print version and exit. |
 | `--data-path <PATH>` | None (in-memory) | Persist tsink data under PATH. |
 | `--wal-enabled <BOOL>` | `true` | Enable WAL. |
 | `--no-wal` | — | Disable WAL (shorthand). |
@@ -185,6 +194,8 @@ cargo run -p tsink-server -- server --listen 127.0.0.1:9201 --data-path ./tsink-
 | `--tls-cert <PATH>` | — | TLS certificate file (PEM). Requires `--tls-key`. |
 | `--tls-key <PATH>` | — | TLS private key file (PEM). Requires `--tls-cert`. |
 | `--auth-token <TOKEN>` | — | Require Bearer token on all endpoints except health probes. |
+| `--enable-admin-api` | `false` | Enable admin snapshot/restore endpoints. |
+| `--admin-path-prefix <PATH>` | — | Restrict admin snapshot/restore paths under a canonical root. Requires `--enable-admin-api`. |
 
 ### Endpoints
 
@@ -202,9 +213,9 @@ cargo run -p tsink-server -- server --listen 127.0.0.1:9201 --data-path ./tsink-
 | POST | `/api/v1/read` | Prometheus remote read (protobuf + snappy). |
 | POST | `/api/v1/import/prometheus` | Prometheus text exposition format ingestion. |
 | GET | `/api/v1/status/tsdb` | TSDB stats (JSON). |
-| POST | `/api/v1/admin/snapshot` | Create atomic segment-consistent, WAL-aware snapshot (`{\"path\":\"...\"}`). |
-| POST | `/api/v1/admin/restore` | Restore snapshot to a data directory (`{\"snapshotPath\":\"...\",\"dataPath\":\"...\"}`). |
-| POST | `/api/v1/admin/delete_series` | Delete series (stub, returns 501). |
+| POST | `/api/v1/admin/snapshot` | Admin-only endpoint (disabled by default): create snapshot (`{\"path\":\"...\"}`). |
+| POST | `/api/v1/admin/restore` | Admin-only endpoint (disabled by default): restore snapshot (`{\"snapshotPath\":\"...\",\"dataPath\":\"...\"}`). |
+| POST | `/api/v1/admin/delete_series` | Admin-only endpoint (disabled by default, currently stubbed with `501`). |
 
 ### TLS
 
@@ -219,6 +230,27 @@ cargo run -p tsink-server -- server \
 ### Authentication
 
 When `--auth-token` is set, all requests except `GET /healthz` and `GET /ready` must include the header `Authorization: Bearer <TOKEN>`. Unauthenticated requests receive a `401 Unauthorized` response.
+
+### Admin API
+
+Admin endpoints are disabled by default. Enabling requires both `--enable-admin-api` and `--auth-token`:
+
+```bash
+cargo run -p tsink-server -- server \
+  --data-path ./tsink-data \
+  --auth-token secret-token \
+  --enable-admin-api
+```
+
+To constrain snapshot/restore destinations to a fixed root:
+
+```bash
+cargo run -p tsink-server -- server \
+  --data-path ./tsink-data \
+  --auth-token secret-token \
+  --enable-admin-api \
+  --admin-path-prefix /srv/tsink-admin
+```
 
 ### Graceful Shutdown
 
@@ -370,6 +402,7 @@ The Python API mirrors the Rust API — see the sections below for details on qu
 | `select_series(SeriesSelection)` | Matcher-based series discovery (`=`, `!=`, `=~`, `!~`) with optional time-window filtering. |
 
 All time ranges are half-open: `[start, end)`.
+Matcher-based `select_series` queries are resolved via persisted inverted postings (roaring bitmaps) when available, not by full scan.
 
 ### Downsampling and Aggregation
 
@@ -476,7 +509,7 @@ Labels are key-value pairs that identify a series alongside the metric name. Lab
 | Label value length | 16,384 bytes (16 KB) |
 | Metric name length | 65,535 bytes |
 
-Empty label names or values are rejected. Oversized values are truncated at the marshaling boundary.
+Empty label names or values are rejected. Oversized metric/label names and values are rejected with validation errors (`InvalidMetricName` / `InvalidLabel`); they are not silently truncated on write.
 
 ## PromQL Engine
 
@@ -521,19 +554,22 @@ Aggregation operators: `sum`, `avg`, `min`, `max`, `count`, `topk`, `bottomk` �
 
 Binary operators: `+`, `-`, `*`, `/`, `%`, `^`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `and`, `or`, `unless` — with `on`/`ignoring` vector matching and `bool` modifier.
 
+Recent `0.9.0` alignment updates include metricless-selector matcher semantics, stricter one-to-one vector matching for binary ops, and metric-name dropping behavior for vector binary results.
+
 ## Persistence and WAL
 
 Set `with_data_path(...)` to enable persistence:
 
 ```rust
 use std::time::Duration;
-use tsink::{StorageBuilder, WalSyncMode};
+use tsink::{StorageBuilder, WalReplayMode, WalSyncMode};
 
 let storage = StorageBuilder::new()
     .with_data_path("./tsink-data")
     .with_chunk_points(2048)
     .with_wal_enabled(true)
     .with_wal_sync_mode(WalSyncMode::Periodic(Duration::from_secs(1)))
+    .with_wal_replay_mode(WalReplayMode::Salvage) // default
     .build()?;
 ```
 
@@ -541,6 +577,8 @@ Behavior:
 - `close()` flushes active chunks and writes immutable segment files.
 - With WAL enabled, reopening the same path replays durable WAL frames automatically.
 - Recovery is idempotent — a high-water mark prevents double-apply of WAL frames.
+- Persistent flush/compaction maintenance runs for `data_path` storage even when WAL is disabled.
+- A per-path process lock file (`.tsink.lock`) prevents concurrent opens of the same `data_path`.
 
 ### Sync Modes
 
@@ -549,12 +587,55 @@ Behavior:
 | `WalSyncMode::Periodic(Duration)` | Lower fsync overhead; small recent-write loss window on crash. |
 | `WalSyncMode::PerAppend` | Strongest durability for acknowledged writes; higher fsync cost. |
 
+### Replay Modes
+
+| Mode | Behavior on mid-log WAL corruption/truncation |
+|---|---|
+| `WalReplayMode::Salvage` (default) | Replays valid prefix and stops at first broken frame. |
+| `WalReplayMode::Strict` | Fails startup replay immediately with corruption error. |
+
+## Observability
+
+Use `observability_snapshot()` to inspect structured runtime internals:
+
+```rust
+let obs = storage.observability_snapshot();
+println!("wal bytes={}", obs.wal.size_bytes);
+println!("flush runs={}", obs.flush.pipeline_runs_total);
+println!("compaction runs={}", obs.compaction.runs_total);
+println!("select calls={}", obs.query.select_calls_total);
+println!("degraded={}", obs.health.degraded);
+```
+
+`obs.health` also exposes `background_errors_total`, `fail_fast_enabled`, `fail_fast_triggered`, and `last_background_error`.
+
+## Snapshots and Restore
+
+Create an atomic, segment-consistent, WAL-aware snapshot from a live storage:
+
+```rust
+storage.snapshot(std::path::Path::new("/backups/tsink-snap-001"))?;
+```
+
+Restore atomically into another data directory:
+
+```rust
+tsink::StorageBuilder::restore_from_snapshot(
+    std::path::Path::new("/backups/tsink-snap-001"),
+    std::path::Path::new("/data/tsink-restore"),
+)?;
+```
+
+`restore_from_snapshot` replaces the destination through a staged publish (with rollback on activation failure) and preserves WAL replay semantics on reopen.
+
 ## On-Disk Layout
 
-When persistence is enabled, tsink writes separate numeric/blob lane segment families:
+When persistence is enabled, tsink writes separate numeric/blob lane segment families plus a global series index:
 
 ```text
 <data_path>/
+  series_index.bin
+  .tsink.lock
   lane_numeric/
     segments/
       L0/...
@@ -565,7 +646,7 @@ When persistence is enabled, tsink writes separate numeric/blob lane segment fam
       L0/...
       L1/...
       L2/...
-  wal/
+  wal/                      # Present when WAL is enabled
     wal-0000000000000000.log
     wal-0000000000000001.log
     ...
@@ -574,7 +655,11 @@ When persistence is enabled, tsink writes separate numeric/blob lane segment fam
 Each segment directory contains:
 `manifest.bin`, `chunks.bin`, `chunk_index.bin`, `series.bin`, `postings.bin`.
 
-The storage format uses CRC32c and XXH64 checksums for corruption detection and a crash-safe commit protocol (write temps, fsync, rename atomically).
+Storage format notes:
+- `0.9.0` uses segment format v2 (`TSM2/CHK2/CID2/SRS2/PST2` headers).
+- `postings.bin` stores roaring bitmap payloads for matcher acceleration.
+- `chunks.bin` records may be stored uncompressed or zstd-compressed (flagged per chunk).
+- CRC32 + XXH64 checksums and crash-safe staged publish (`write tmp -> fsync -> atomic rename`) are used for integrity and durability.
 
 ### Compaction
 
@@ -617,6 +702,8 @@ Timestamps and numeric values (`f64`, `i64`, `u64`, `bool`) are encoded with spe
 ### Blob Lane
 
 `bytes` and `string` values are encoded with delta block compression in a separate blob lane.
+
+After lane encoding, chunk payloads are optionally compressed with fast zstd (level 1) when that reduces size. Read paths transparently decode both compressed and raw payloads.
 
 ## Performance
 
@@ -675,8 +762,9 @@ scripts/measure_perf.sh quick  # Criterion insert/select matrix
 Key internals:
 - **Time partitions** split data by wall-clock intervals (default: 1 hour).
 - **Chunks** group data points (default: 2048 per chunk) with delta-of-delta timestamp encoding and per-lane value encoding (numeric vs. blob).
-- **Series registry** maps metric name + label set → series ID, with inverted postings for label-based lookups.
-- **Segment files** are immutable, CRC32c + XXH64 checksummed, and consist of: `manifest.bin`, `chunks.bin`, `chunk_index.bin`, `series.bin`, `postings.bin`.
+- **Series registry + global index** maps metric name + label set → series ID and persists dictionaries in `series_index.bin` for faster reopen/startup.
+- **Inverted postings** use roaring bitmaps for metric/label matcher candidate resolution.
+- **Segment files** are immutable, CRC32 + XXH64 checksummed, and consist of: `manifest.bin`, `chunks.bin`, `chunk_index.bin`, `series.bin`, `postings.bin`.
 - **Sharded locking** (64 internal shards) reduces write contention under high concurrency.
 - **Background flush** periodically converts active chunks into immutable chunks (default: every 250ms).
 - **Background compaction** merges segments across levels (default: every 5s).
@@ -689,6 +777,7 @@ Key internals:
 | `with_chunk_points(n)` | `2048` | Target data points per chunk before flushing. |
 | `with_wal_enabled(bool)` | `true` | Enable/disable write-ahead logging. |
 | `with_wal_sync_mode(mode)` | `Periodic(1s)` | WAL fsync policy. |
+| `with_wal_replay_mode(mode)` | `Salvage` | WAL corruption handling during replay (`Salvage` / `Strict`). |
 | `with_wal_size_limit(bytes)` | Unlimited | Hard cap on total WAL bytes across all WAL segments. |
 | `with_wal_buffer_size(n)` | 4096 | WAL buffer size in bytes. |
 | `with_retention(duration)` | 14 days | Data retention window. |
@@ -699,6 +788,7 @@ Key internals:
 | `with_partition_duration(duration)` | 1 hour | Time partition granularity. |
 | `with_memory_limit(bytes)` | Unlimited | Hard in-memory budget with admission backpressure before writes. |
 | `with_cardinality_limit(series)` | Unlimited | Hard cap on total metric+label series cardinality. |
+| `with_background_fail_fast(bool)` | `false` | Stop new operations after background flush/compaction worker failures. |
 
 ## Resource Limits and Backpressure
 
@@ -712,7 +802,7 @@ let storage = StorageBuilder::new()
     .build()?;
 ```
 
-When the memory budget is reached, new writes block until a background flush frees memory. This provides admission backpressure rather than OOM crashes.
+When the memory budget is reached, new writes block until a background flush frees memory. This provides admission backpressure rather than OOM crashes. `0.9.0` also switched write-path memory checks to incremental shard accounting to avoid full memory scans on each admission decision.
 
 ### Cardinality Limit
 
@@ -736,10 +826,12 @@ Caps the total WAL bytes on disk. Writes that would exceed this limit return `Ts
 
 ## Container Support
 
-tsink automatically detects cgroup v1/v2 CPU and memory quotas when running inside containers (Docker, Kubernetes, etc.). This affects:
+tsink automatically detects cgroup CPU quotas when running inside containers (Docker, Kubernetes, etc.). This affects:
 
 - **Writer thread count** — defaults to available CPUs within the cgroup quota, not the host CPU count.
-- **Rayon thread pool** — sized to respect container limits.
+- **Async read worker default** (when using `async-storage`) — also derived from cgroup CPU availability.
+
+`tsink::cgroup::get_memory_limit()` is available if you want to derive an explicit `with_memory_limit(...)` value from container limits.
 
 Override with the `TSINK_MAX_CPUS` environment variable:
 
@@ -761,6 +853,8 @@ All fallible operations return `tsink::Result<T>`, which wraps `TsinkError`. Key
 | `ValueTypeMismatch` | Inserting a different value type into an existing series. |
 | `OutOfRetention` | Data point timestamp is outside the retention window. |
 | `DataCorruption` | Checksum mismatch during segment read. |
+| `StorageShuttingDown` | Background fail-fast was triggered after a worker failure. |
+| `InvalidConfiguration` | Invalid builder/runtime settings (for example concurrent `data_path` lock conflict, invalid snapshot/restore paths, or unsupported mode combinations). |
 | `StorageClosed` | Operation attempted after `close()` was called. |
 
 ## Advanced Usage
@@ -821,7 +915,7 @@ assert!(points.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
 After a crash, tsink automatically replays the WAL on the next open:
 
 ```rust
-use tsink::StorageBuilder;
+use tsink::{StorageBuilder, WalReplayMode};
 
 // First run — data is written and WAL-protected
 let storage = StorageBuilder::new()
@@ -832,16 +926,17 @@ storage.insert_rows(&rows)?;
 
 // Next run — recovery is automatic
 let storage = StorageBuilder::new()
-    .with_data_path("/data/tsink")  // Same path
-    .build()?;  // WAL replay happens here
+    .with_data_path("/data/tsink") // Same path
+    .with_wal_replay_mode(WalReplayMode::Salvage)
+    .build()?; // WAL replay happens here
 
 // Previously inserted data is available
 let points = storage.select("metric", &[], 0, i64::MAX)?;
 ```
 
-Recovery is idempotent — a high-water mark ensures WAL frames are never applied twice.
+Recovery is idempotent — a high-water mark ensures WAL frames are never applied twice. Use `WalReplayMode::Strict` if you prefer startup failure over salvage when a WAL tail is corrupted.
 
-### Snapshots and Restore
+### Snapshot Workflow Example
 
 Use `snapshot()` for an atomic, segment-consistent, WAL-aware backup of a live storage:
 
@@ -943,7 +1038,7 @@ cargo run --example comprehensive
 |---|---|
 | `basic_usage` | Simple insert and select with labels. |
 | `persistent_storage` | Disk persistence and WAL recovery. |
-| `production_example` | Resource limits, query options, and custom aggregation. |
+| `production_example` | Multi-threaded ingest/query workload with tracing-friendly logging and persistent config knobs. |
 | `comprehensive` | Multiple features: concurrent ops, retention, downsampling, and aggregation. |
 
 ## Benchmarks and Tests
@@ -954,7 +1049,9 @@ cargo test --features promql        # Include PromQL tests
 cargo test --features async-storage # Include async tests
 
 cargo bench                         # Run all benchmarks
-cargo bench --bench storage_benchmarks -- '^concurrent_rw/' --quick --noplot
+cargo bench --bench storage_benchmarks -- '^(insert_rows|select|concurrent_rw)/' --quick --noplot
+scripts/measure_perf.sh quick       # Focused insert/select matrix
+scripts/measure_bpp.sh quick        # Workload bytes-per-point
 ```
 
 ### Benchmark Suites
@@ -976,12 +1073,33 @@ The `measure_bpp.sh` script accepts environment variables for workload tuning:
 
 | Variable | Description |
 |---|---|
+| `TSINK_BPP_RUNS` | Number of workload benchmark repetitions in `measure_bpp.sh`. |
 | `TSINK_ACTIVE_SERIES` | Number of concurrent series. |
+| `TSINK_PRIME_ALL_SERIES` | Prime all series before measurement (`1`/`true` to enable). |
+| `TSINK_MIN_POINTS_PER_SERIES` | Minimum target points per series before measuring BPP. |
 | `TSINK_WARMUP_POINTS` / `TSINK_MEASURE_POINTS` | Points ingested during warmup and measurement phases. |
 | `TSINK_BATCH_SIZE` | Insert batch size. |
 | `TSINK_OOO_MAX_SECONDS` / `TSINK_OOO_PERMILLE` | Out-of-order write tuning. |
+| `TSINK_SPARSE_EMIT_PERMILLE` / `TSINK_SHORT_LIVED_LIFETIME_STEPS` | Sparse and short-lived series workload tuning. |
 | `TSINK_RETENTION_SECONDS` / `TSINK_PARTITION_SECONDS` | Retention and partition windows. |
+| `TSINK_STEP_SECONDS` / `TSINK_SETTLE_MILLIS` | Workload step spacing and settle delay tuning. |
 | `TSINK_FAIL_ON_TARGET` | Fail if compression target is not met. |
+
+## Project Structure
+
+```text
+.
+├── src/                    # Core tsink engine + public API
+├── crates/
+│   ├── tsink-server/       # Prometheus wire-compatible server binary
+│   └── tsink-uniffi/       # Python bindings (UniFFI)
+├── examples/               # Runnable usage examples
+├── benches/                # Criterion benchmark suites
+├── tests/                  # Integration tests
+├── scripts/                # Benchmark/perf helper scripts
+├── CHANGELOG.md            # Release notes
+└── README.md
+```
 
 ## Contributing
 
@@ -1000,7 +1118,7 @@ cargo clippy -- -D warnings   # Lint
 
 ## Minimum Supported Rust Version
 
-Rust **2021 edition**. Tested on stable.
+No explicit MSRV is pinned yet. The crate uses Rust 2021 edition and is tested on stable.
 
 ## License
 

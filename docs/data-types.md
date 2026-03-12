@@ -353,59 +353,59 @@ Built-in aggregation operates on the `f64` projection of a value (`Value::as_f64
 
 ## Python Bindings Type Mapping
 
-The UniFFI Python bindings expose all types with a `U` prefix. The mapping to Rust types is direct:
+The UniFFI Python bindings expose the same model names as the Rust API. The mapping is direct:
 
 | Python type | Rust equivalent |
 |---|---|
-| `UValue` (enum) | `Value` |
-| `UDataPoint` | `DataPoint` |
-| `URow` | `Row` |
-| `ULabel` | `Label` |
-| `UNativeHistogram` | `NativeHistogram` |
-| `UHistogramBucketSpan` | `HistogramBucketSpan` |
-| `UHistogramCount` (enum) | `HistogramCount` |
-| `UHistogramResetHint` (enum) | `HistogramResetHint` |
+| `Value` (enum) | `Value` |
+| `DataPoint` | `DataPoint` |
+| `Row` | `Row` |
+| `Label` | `Label` |
+| `NativeHistogram` | `NativeHistogram` |
+| `HistogramBucketSpan` | `HistogramBucketSpan` |
+| `HistogramCount` (enum) | `HistogramCount` |
+| `HistogramResetHint` (enum) | `HistogramResetHint` |
 
-`UValue` is a tagged-union enum with named fields per variant:
+`Value` is a tagged-union enum with named fields per variant:
 
 ```python
-from tsink_uniffi import UValue, UDataPoint, UNativeHistogram, UHistogramBucketSpan
+from tsink import Value, DataPoint, NativeHistogram, HistogramBucketSpan
 
 # float64
-dp = UDataPoint(timestamp=1_700_000_000_000, value=UValue.F64(v=1.5))
+dp = DataPoint(timestamp=1_700_000_000_000, value=Value.F64(v=1.5))
 
 # int64
-dp = UDataPoint(timestamp=1_700_000_000_000, value=UValue.I64(v=-7))
+dp = DataPoint(timestamp=1_700_000_000_000, value=Value.I64(v=-7))
 
 # uint64
-dp = UDataPoint(timestamp=1_700_000_000_000, value=UValue.U64(v=42))
+dp = DataPoint(timestamp=1_700_000_000_000, value=Value.U64(v=42))
 
 # bool
-dp = UDataPoint(timestamp=1_700_000_000_000, value=UValue.Bool(v=True))
+dp = DataPoint(timestamp=1_700_000_000_000, value=Value.Bool(v=True))
 
 # bytes
-dp = UDataPoint(timestamp=1_700_000_000_000, value=UValue.Bytes(v=b"\x01\x02"))
+dp = DataPoint(timestamp=1_700_000_000_000, value=Value.Bytes(v=b"\x01\x02"))
 
 # string
-dp = UDataPoint(timestamp=1_700_000_000_000, value=UValue.Str(v="hello"))
+dp = DataPoint(timestamp=1_700_000_000_000, value=Value.Str(v="hello"))
 
 # native histogram
-hist = UNativeHistogram(
-    count=UHistogramCount.Int(v=10),
+hist = NativeHistogram(
+    count=HistogramCount.Int(v=10),
     sum=5.5,
     schema=1,
     zero_threshold=0.0,
-    zero_count=UHistogramCount.Int(v=0),
+    zero_count=HistogramCount.Int(v=0),
     negative_spans=[],
     negative_deltas=[],
     negative_counts=[],
-    positive_spans=[UHistogramBucketSpan(offset=0, length=2)],
+    positive_spans=[HistogramBucketSpan(offset=0, length=2)],
     positive_deltas=[3, 2],
     positive_counts=[],
-    reset_hint=UHistogramResetHint.NO,
+    reset_hint=HistogramResetHint.NO,
     custom_values=[],
 )
-dp = UDataPoint(timestamp=1_700_000_000_000, value=UValue.Histogram(v=hist))
+dp = DataPoint(timestamp=1_700_000_000_000, value=Value.Histogram(v=hist))
 ```
 
 Note that in the Python bindings the `string` variant is named `Str` (not `String`) to avoid conflicting with the Python built-in.

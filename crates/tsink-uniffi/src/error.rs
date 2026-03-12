@@ -1,4 +1,4 @@
-use tsink::TsinkError;
+use tsink_core::TsinkError;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]

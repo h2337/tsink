@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use tsink::Storage;
+use tsink_core::Storage;
 
 use crate::error::{Result, TsinkUniFFIError};
 use crate::query::{UQueryOptions, USeriesSelection};
@@ -32,14 +32,14 @@ impl TsinkDB {
 #[uniffi::export]
 impl TsinkDB {
     pub fn insert_rows(&self, rows: Vec<URow>) -> Result<()> {
-        let rows: Vec<tsink::Row> = rows.into_iter().map(Into::into).collect();
+        let rows: Vec<tsink_core::Row> = rows.into_iter().map(Into::into).collect();
         self.storage
             .insert_rows(&rows)
             .map_err(TsinkUniFFIError::from)
     }
 
     pub fn insert_rows_with_result(&self, rows: Vec<URow>) -> Result<UWriteResult> {
-        let rows: Vec<tsink::Row> = rows.into_iter().map(Into::into).collect();
+        let rows: Vec<tsink_core::Row> = rows.into_iter().map(Into::into).collect();
         self.storage
             .insert_rows_with_result(&rows)
             .map(Into::into)
@@ -53,7 +53,7 @@ impl TsinkDB {
         start: i64,
         end: i64,
     ) -> Result<Vec<UDataPoint>> {
-        let labels: Vec<tsink::Label> = labels.into_iter().map(Into::into).collect();
+        let labels: Vec<tsink_core::Label> = labels.into_iter().map(Into::into).collect();
         self.storage
             .select(&metric, &labels, start, end)
             .map(|dps| dps.into_iter().map(Into::into).collect())
@@ -97,7 +97,7 @@ impl TsinkDB {
         start: i64,
         end: i64,
     ) -> Result<Vec<USeriesPoints>> {
-        let series: Vec<tsink::MetricSeries> = series.into_iter().map(Into::into).collect();
+        let series: Vec<tsink_core::MetricSeries> = series.into_iter().map(Into::into).collect();
         self.storage
             .select_many(&series, start, end)
             .map(|series_points| series_points.into_iter().map(Into::into).collect())
@@ -177,7 +177,7 @@ impl TsinkDB {
         end: i64,
         options: UQueryRowsScanOptions,
     ) -> Result<UQueryRowsPage> {
-        let series: Vec<tsink::MetricSeries> = series.into_iter().map(Into::into).collect();
+        let series: Vec<tsink_core::MetricSeries> = series.into_iter().map(Into::into).collect();
         self.storage
             .scan_series_rows(&series, start, end, options.into())
             .map(Into::into)
@@ -220,7 +220,8 @@ impl TsinkDB {
         &self,
         policies: Vec<URollupPolicy>,
     ) -> Result<URollupObservabilitySnapshot> {
-        let policies: Vec<tsink::RollupPolicy> = policies.into_iter().map(Into::into).collect();
+        let policies: Vec<tsink_core::RollupPolicy> =
+            policies.into_iter().map(Into::into).collect();
         self.storage
             .apply_rollup_policies(policies)
             .map(Into::into)

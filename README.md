@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://crates.io/crates/tsink"><img src="https://img.shields.io/crates/v/tsink.svg" alt="crates.io"></a>
   <a href="https://docs.rs/tsink/latest/tsink"><img src="https://img.shields.io/docsrs/tsink.svg" alt="docs.rs"></a>
-  <a href="https://pypi.org/project/tsink-uniffi"><img src="https://img.shields.io/pypi/v/tsink-uniffi.svg" alt="pypi.org"></a>
+  <a href="https://pypi.org/project/tsink"><img src="https://img.shields.io/pypi/v/tsink.svg" alt="pypi.org"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
@@ -55,17 +55,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 UniFFI bindings expose the core API as a native Python module:
 
 ```python
-from tsink_uniffi import TsinkStorageBuilder, UDataPoint, URow, UValue
+from tsink import TsinkStorageBuilder, DataPoint, Row, Value
 
 builder = TsinkStorageBuilder()
 builder.with_data_path("./tsink-data")
 db = builder.build()
 
 db.insert_rows([
-    URow(
+    Row(
         metric="cpu_usage",
         labels=[],
-        data_point=UDataPoint(timestamp=1_700_000_000_000, value=UValue.F64(v=42.0)),
+        data_point=DataPoint(timestamp=1_700_000_000_000, value=Value.F64(v=42.0)),
     )
 ])
 print(db.select("cpu_usage", [], 0, 2_000_000_000_000))

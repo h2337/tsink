@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "tsink_uniffi"
+name = "tsink"
 requires-python = ">=3.8"
 description = "Python bindings for tsink time-series database"
 license = { text = "MIT" }

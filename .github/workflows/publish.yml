@@ -92,7 +92,7 @@ jobs:
         id: check
         run: |
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tsink-ci' \
-            "https://pypi.org/pypi/tsink_uniffi/${{ steps.version.outputs.version }}/json")
+            "https://pypi.org/pypi/tsink/${{ steps.version.outputs.version }}/json")
           if [ "$STATUS" = "200" ]; then
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
           else

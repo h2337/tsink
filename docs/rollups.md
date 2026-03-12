@@ -369,8 +369,8 @@ storage.close()?;
 ## Python bindings
 
 ```python
-from tsink_uniffi import (
-    TsinkStorageBuilder, UDataPoint, URollupPolicy, URow, UValue, UAggregation
+from tsink import (
+    TsinkStorageBuilder, DataPoint, RollupPolicy, Row, Value, Aggregation
 )
 
 builder = TsinkStorageBuilder()
@@ -378,17 +378,17 @@ builder.with_data_path("./tsink-data")
 db = builder.build()
 
 db.insert_rows([
-    URow(metric="cpu_usage", labels=[], data_point=UDataPoint(timestamp=1_700_000_060_000, value=UValue.F64(v=45.0))),
-    URow(metric="cpu_usage", labels=[], data_point=UDataPoint(timestamp=1_700_000_120_000, value=UValue.F64(v=50.0))),
+    Row(metric="cpu_usage", labels=[], data_point=DataPoint(timestamp=1_700_000_060_000, value=Value.F64(v=45.0))),
+    Row(metric="cpu_usage", labels=[], data_point=DataPoint(timestamp=1_700_000_120_000, value=Value.F64(v=50.0))),
 ])
 
 snapshot = db.apply_rollup_policies([
-    URollupPolicy(
+    RollupPolicy(
         id="cpu-1min",
         metric="cpu_usage",
         match_labels=[],
         interval=60_000,
-        aggregation=UAggregation.AVG,
+        aggregation=Aggregation.AVG,
         bucket_origin=0,
     )
 ])

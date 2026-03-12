@@ -272,7 +272,7 @@ These are exposed under the `/metrics` endpoint in the server.
 The tiering configuration is available through the UniFFI Python bindings:
 
 ```python
-from tsink_uniffi import TsinkStorageBuilder
+from tsink import TsinkStorageBuilder
 
 builder = TsinkStorageBuilder()
 builder.with_data_path("./local-data")

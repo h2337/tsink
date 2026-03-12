@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use tempfile::tempdir;
-use tsink_uniffi::*;
+use tsink::*;
 
 fn label(name: &str, value: &str) -> ULabel {
     ULabel {

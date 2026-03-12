@@ -12,13 +12,13 @@ use crate::error::{Result, TsinkUniFFIError};
 
 #[derive(uniffi::Object)]
 pub struct TsinkStorageBuilder {
-    inner: Mutex<Option<tsink::StorageBuilder>>,
+    inner: Mutex<Option<tsink_core::StorageBuilder>>,
 }
 
 impl TsinkStorageBuilder {
     fn with_builder<F>(&self, f: F) -> Result<()>
     where
-        F: FnOnce(tsink::StorageBuilder) -> tsink::StorageBuilder,
+        F: FnOnce(tsink_core::StorageBuilder) -> tsink_core::StorageBuilder,
     {
         let mut guard = self.inner.lock();
         let builder = guard.take().ok_or(TsinkUniFFIError::InvalidInput {
@@ -34,7 +34,7 @@ impl TsinkStorageBuilder {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(Some(tsink::StorageBuilder::new())),
+            inner: Mutex::new(Some(tsink_core::StorageBuilder::new())),
         })
     }
 
@@ -186,7 +186,7 @@ mod tests {
 
 #[uniffi::export]
 pub fn restore_from_snapshot(snapshot_path: String, data_path: String) -> Result<()> {
-    tsink::StorageBuilder::restore_from_snapshot(
+    tsink_core::StorageBuilder::restore_from_snapshot(
         std::path::Path::new(snapshot_path.as_str()),
         std::path::Path::new(data_path.as_str()),
     )

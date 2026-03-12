@@ -1,4 +1,4 @@
-uniffi::setup_scaffolding!();
+uniffi::setup_scaffolding!("tsink");
 
 mod builder;
 mod conversions;

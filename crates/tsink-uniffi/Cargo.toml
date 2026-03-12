@@ -7,10 +7,10 @@ license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "lib"]
-name = "tsink_uniffi"
+name = "tsink"
 
 [dependencies]
-tsink = { version = "0.10.0", path = "../.." }
+tsink_core = { package = "tsink", version = "0.10.0", path = "../.." }
 uniffi = { version = "0.31", features = ["cli"] }
 parking_lot = "0.12"
 thiserror = "2.0"

@@ -119,6 +119,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             args: ""
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            args: ""
     steps:
       - uses: actions/checkout@v4
 

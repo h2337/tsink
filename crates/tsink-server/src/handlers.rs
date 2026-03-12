@@ -14684,6 +14684,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_cluster_control_snapshot_persist_does_not_clobber_newer_state() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_single_node_control_state(&temp_dir, |_| {});
+        let stale_snapshot_state = cluster_context
+            .control_consensus
+            .as_ref()
+            .expect("control consensus should be present")
+            .current_state();
+
+        let join_request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/admin/cluster/join".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: serde_json::to_vec(&json!({
+                "nodeId": "node-b",
+                "endpoint": "127.0.0.1:9302"
+            }))
+            .expect("json should encode"),
+        };
+        let join_response = handle_request_with_admin_and_cluster(
+            &storage,
+            &engine,
+            join_request,
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            true,
+            None,
+            None,
+            Some(cluster_context.as_ref()),
+        )
+        .await;
+        assert_eq!(join_response.status, 200);
+
+        let newer_state = cluster_context
+            .control_consensus
+            .as_ref()
+            .expect("control consensus should be present")
+            .current_state();
+        assert!(newer_state.node_record("node-b").is_some());
+
+        cluster_context
+            .control_state_store
+            .as_ref()
+            .expect("control state store should be present")
+            .persist(&stale_snapshot_state)
+            .expect("stale snapshot persist should be ignored");
+
+        let persisted_state = cluster_context
+            .control_state_store
+            .as_ref()
+            .expect("control state store should be present")
+            .load()
+            .expect("persisted control state should load")
+            .expect("persisted control state should exist");
+        assert_eq!(persisted_state, newer_state);
+    }
+
+    #[tokio::test]
     async fn admin_cluster_control_restore_can_force_local_leader() {
         let storage = make_storage();
         let engine = make_engine(&storage);

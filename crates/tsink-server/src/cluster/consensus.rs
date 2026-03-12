@@ -10,11 +10,10 @@ use crate::cluster::rpc::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tsink::engine::fs_utils::write_file_atomically_and_sync_parent;
 
 const CONTROL_LOG_MAGIC: &str = "tsink-control-log";
 const CONTROL_LOG_SCHEMA_VERSION: u16 = 1;
@@ -507,6 +506,7 @@ impl ControlConsensusRuntime {
         if state.current_term < state.control_state.applied_log_term {
             state.current_term = state.control_state.applied_log_term.max(1);
         }
+        self.state_store.replace(&state.control_state)?;
         self.persist_log_locked(&state)?;
         Ok(state.control_state.clone())
     }
@@ -1817,35 +1817,10 @@ fn load_log_file(path: &Path) -> Result<ControlLogFileV1, String> {
 }
 
 fn write_atomically(path: &Path, encoded: &[u8]) -> Result<(), String> {
-    let tmp_path = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(|err| {
-            format!(
-                "failed to open temporary control-log file {}: {err}",
-                tmp_path.display()
-            )
-        })?;
-    file.write_all(encoded).map_err(|err| {
+    write_file_atomically_and_sync_parent(path, encoded).map_err(|err| {
         format!(
-            "failed to write temporary control-log file {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    file.sync_all().map_err(|err| {
-        format!(
-            "failed to fsync temporary control-log file {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
-            "failed to replace control-log file {} with {}: {err}",
-            path.display(),
-            tmp_path.display()
+            "failed to persist control-log file {}: {err}",
+            path.display()
         )
     })
 }
@@ -3323,6 +3298,14 @@ mod tests {
             .expect("restore should succeed");
         assert_eq!(restored_state, saved_state);
         assert_eq!(runtime.current_state(), saved_state);
+        assert_eq!(
+            runtime
+                .state_store
+                .load()
+                .expect("persisted state should load")
+                .expect("persisted state should exist"),
+            saved_state
+        );
 
         let restored_log = runtime.log_recovery_snapshot();
         assert_eq!(restored_log.commit_index, saved_log.commit_index);
@@ -3354,6 +3337,16 @@ mod tests {
         assert_eq!(restored_state.leader_node_id.as_deref(), Some("node-a"));
         assert_eq!(
             runtime.current_state().leader_node_id.as_deref(),
+            Some("node-a")
+        );
+        assert_eq!(
+            runtime
+                .state_store
+                .load()
+                .expect("persisted state should load")
+                .expect("persisted state should exist")
+                .leader_node_id
+                .as_deref(),
             Some("node-a")
         );
     }

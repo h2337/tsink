@@ -1237,6 +1237,14 @@ mod tests {
         .expect("outbox should open")
     }
 
+    fn local_stale_record_count(outbox: &HintedHandoffOutbox) -> u64 {
+        let state = outbox
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stale_record_count(&state)
+    }
+
     async fn spawn_success_ingest_server() -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1405,7 +1413,7 @@ mod tests {
         let before_cleanup = outbox.backlog_snapshot();
         let metrics_before = outbox_metrics_snapshot();
         assert_eq!(before_cleanup.queued_entries, 1);
-        assert!(metrics_before.stale_records > 0);
+        assert!(local_stale_record_count(&outbox) > 0);
 
         outbox.cleanup_once().expect("cleanup should succeed");
 
@@ -1413,7 +1421,7 @@ mod tests {
         let metrics_after = outbox_metrics_snapshot();
         assert_eq!(after_cleanup.queued_entries, 1);
         assert!(after_cleanup.log_bytes <= before_cleanup.log_bytes);
-        assert_eq!(metrics_after.stale_records, 0);
+        assert_eq!(local_stale_record_count(&outbox), 0);
         assert!(metrics_after.cleanup_runs_total > metrics_before.cleanup_runs_total);
         assert!(
             metrics_after.cleanup_compactions_total >= metrics_before.cleanup_compactions_total
@@ -1451,8 +1459,12 @@ mod tests {
         assert!(stalled[0].oldest_age_ms >= stale_age_ms);
         assert!(stalled[0].first_stalled_unix_ms > 0);
 
-        let metrics = outbox_metrics_snapshot();
-        assert!(metrics.stalled_peers >= 1);
-        assert!(metrics.stalled_oldest_age_ms >= stale_age_ms);
+        let stalled_again = outbox.stalled_peer_snapshot();
+        assert_eq!(stalled_again.len(), 1);
+        assert_eq!(
+            stalled_again[0].first_stalled_unix_ms,
+            stalled[0].first_stalled_unix_ms
+        );
+        assert!(stalled_again[0].oldest_age_ms >= stale_age_ms);
     }
 }

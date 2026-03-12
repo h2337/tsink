@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tsink::engine::fs_utils::write_file_atomically_and_sync_parent;
 
 pub const RBAC_AUTH_VERIFIED_HEADER: &str = "x-tsink-rbac-verified";
 pub const RBAC_AUTH_PRINCIPAL_ID_HEADER: &str = "x-tsink-auth-principal-id";
@@ -659,40 +660,47 @@ impl RbacRegistry {
         spec: ServiceAccountSpec,
     ) -> Result<ServiceAccountCredential, String> {
         let id = spec.id.trim().to_string();
-        let token = self.generate_unique_service_account_token()?;
         let now = now_unix_ms();
-        let result = self.mutate_config(|config| {
-            validate_identifier(&id, "service account id")?;
-            if config.principals.iter().any(|principal| principal.id == id) {
-                return Err(format!(
-                    "service account id '{}' conflicts with an existing principal",
-                    id
-                ));
-            }
-            if config
-                .service_accounts
-                .iter()
-                .any(|service_account| service_account.id == id)
-            {
-                return Err(format!("duplicate service account id '{}'", id));
-            }
-            config.service_accounts.push(ServiceAccountDefinition {
-                id: id.clone(),
-                token: token.clone(),
-                description: normalize_optional_text(spec.description.clone()),
-                disabled: spec.disabled,
-                created_unix_ms: now,
-                updated_unix_ms: now,
-                last_rotated_unix_ms: now,
-                bindings: binding_snapshots_to_definitions(&spec.bindings),
-            });
-            Ok(())
-        });
-        match result {
-            Ok(()) => {
-                let service_account = self
-                    .service_account_snapshot(&id)
+        let result = self.mutate_config(
+            |config| {
+                validate_identifier(&id, "service account id")?;
+                if config.principals.iter().any(|principal| principal.id == id) {
+                    return Err(format!(
+                        "service account id '{}' conflicts with an existing principal",
+                        id
+                    ));
+                }
+                if config
+                    .service_accounts
+                    .iter()
+                    .any(|service_account| service_account.id == id)
+                {
+                    return Err(format!("duplicate service account id '{}'", id));
+                }
+                let token = generate_unique_service_account_token_for_config(config)?;
+                config.service_accounts.push(ServiceAccountDefinition {
+                    id: id.clone(),
+                    token: token.clone(),
+                    description: normalize_optional_text(spec.description.clone()),
+                    disabled: spec.disabled,
+                    created_unix_ms: now,
+                    updated_unix_ms: now,
+                    last_rotated_unix_ms: now,
+                    bindings: binding_snapshots_to_definitions(&spec.bindings),
+                });
+                Ok(token)
+            },
+            |state, token| {
+                let service_account = service_account_snapshot_from_state(state, &id)
                     .ok_or_else(|| format!("service account '{}' was not persisted", id))?;
+                Ok(ServiceAccountCredential {
+                    service_account,
+                    token,
+                })
+            },
+        );
+        match result {
+            Ok(credential) => {
                 self.push_audit_entry(RbacAuditEntryInput {
                     event: "service_account_create".to_string(),
                     outcome: "success".to_string(),
@@ -701,10 +709,7 @@ impl RbacRegistry {
                     auth_method: Some("service_account".to_string()),
                     ..Default::default()
                 });
-                Ok(ServiceAccountCredential {
-                    service_account,
-                    token,
-                })
+                Ok(credential)
             }
             Err(err) => {
                 self.push_audit_entry(RbacAuditEntryInput {
@@ -727,25 +732,28 @@ impl RbacRegistry {
     ) -> Result<RbacServiceAccountSnapshot, String> {
         let id = spec.id.trim().to_string();
         let now = now_unix_ms();
-        let result = self.mutate_config(|config| {
-            let Some(service_account) = config
-                .service_accounts
-                .iter_mut()
-                .find(|service_account| service_account.id == id)
-            else {
-                return Err(format!("unknown service account '{}'", id));
-            };
-            service_account.description = normalize_optional_text(spec.description.clone());
-            service_account.disabled = spec.disabled;
-            service_account.updated_unix_ms = now;
-            service_account.bindings = binding_snapshots_to_definitions(&spec.bindings);
-            Ok(())
-        });
+        let result = self.mutate_config(
+            |config| {
+                let Some(service_account) = config
+                    .service_accounts
+                    .iter_mut()
+                    .find(|service_account| service_account.id == id)
+                else {
+                    return Err(format!("unknown service account '{}'", id));
+                };
+                service_account.description = normalize_optional_text(spec.description.clone());
+                service_account.disabled = spec.disabled;
+                service_account.updated_unix_ms = now;
+                service_account.bindings = binding_snapshots_to_definitions(&spec.bindings);
+                Ok(())
+            },
+            |state, ()| {
+                service_account_snapshot_from_state(state, &id)
+                    .ok_or_else(|| format!("service account '{}' was not persisted", id))
+            },
+        );
         match result {
-            Ok(()) => {
-                let snapshot = self
-                    .service_account_snapshot(&id)
-                    .ok_or_else(|| format!("service account '{}' was not persisted", id))?;
+            Ok(snapshot) => {
                 self.push_audit_entry(RbacAuditEntryInput {
                     event: "service_account_update".to_string(),
                     outcome: "success".to_string(),
@@ -774,26 +782,33 @@ impl RbacRegistry {
     pub fn rotate_service_account(&self, id: &str) -> Result<ServiceAccountCredential, String> {
         let id = id.trim().to_string();
         validate_identifier(&id, "service account id")?;
-        let token = self.generate_unique_service_account_token()?;
         let now = now_unix_ms();
-        let result = self.mutate_config(|config| {
-            let Some(service_account) = config
-                .service_accounts
-                .iter_mut()
-                .find(|service_account| service_account.id == id)
-            else {
-                return Err(format!("unknown service account '{}'", id));
-            };
-            service_account.token = token.clone();
-            service_account.updated_unix_ms = now;
-            service_account.last_rotated_unix_ms = now;
-            Ok(())
-        });
-        match result {
-            Ok(()) => {
-                let service_account = self
-                    .service_account_snapshot(&id)
+        let result = self.mutate_config(
+            |config| {
+                let token = generate_unique_service_account_token_for_config(config)?;
+                let Some(service_account) = config
+                    .service_accounts
+                    .iter_mut()
+                    .find(|service_account| service_account.id == id)
+                else {
+                    return Err(format!("unknown service account '{}'", id));
+                };
+                service_account.token = token.clone();
+                service_account.updated_unix_ms = now;
+                service_account.last_rotated_unix_ms = now;
+                Ok(token)
+            },
+            |state, token| {
+                let service_account = service_account_snapshot_from_state(state, &id)
                     .ok_or_else(|| format!("service account '{}' was not persisted", id))?;
+                Ok(ServiceAccountCredential {
+                    service_account,
+                    token,
+                })
+            },
+        );
+        match result {
+            Ok(credential) => {
                 self.push_audit_entry(RbacAuditEntryInput {
                     event: "service_account_rotate".to_string(),
                     outcome: "success".to_string(),
@@ -802,10 +817,7 @@ impl RbacRegistry {
                     auth_method: Some("service_account".to_string()),
                     ..Default::default()
                 });
-                Ok(ServiceAccountCredential {
-                    service_account,
-                    token,
-                })
+                Ok(credential)
             }
             Err(err) => {
                 self.push_audit_entry(RbacAuditEntryInput {
@@ -830,23 +842,26 @@ impl RbacRegistry {
         let id = id.trim().to_string();
         validate_identifier(&id, "service account id")?;
         let now = now_unix_ms();
-        let result = self.mutate_config(|config| {
-            let Some(service_account) = config
-                .service_accounts
-                .iter_mut()
-                .find(|service_account| service_account.id == id)
-            else {
-                return Err(format!("unknown service account '{}'", id));
-            };
-            service_account.disabled = disabled;
-            service_account.updated_unix_ms = now;
-            Ok(())
-        });
+        let result = self.mutate_config(
+            |config| {
+                let Some(service_account) = config
+                    .service_accounts
+                    .iter_mut()
+                    .find(|service_account| service_account.id == id)
+                else {
+                    return Err(format!("unknown service account '{}'", id));
+                };
+                service_account.disabled = disabled;
+                service_account.updated_unix_ms = now;
+                Ok(())
+            },
+            |state, ()| {
+                service_account_snapshot_from_state(state, &id)
+                    .ok_or_else(|| format!("service account '{}' was not persisted", id))
+            },
+        );
         match result {
-            Ok(()) => {
-                let snapshot = self
-                    .service_account_snapshot(&id)
-                    .ok_or_else(|| format!("service account '{}' was not persisted", id))?;
+            Ok(snapshot) => {
                 self.push_audit_entry(RbacAuditEntryInput {
                     event: if disabled {
                         "service_account_disable".to_string()
@@ -988,70 +1003,32 @@ impl RbacRegistry {
         audit.iter().rev().take(count).cloned().collect()
     }
 
-    fn mutate_config<F>(&self, mutator: F) -> Result<(), String>
+    fn mutate_config<M, T, F, S>(&self, mutator: F, selector: S) -> Result<T, String>
     where
-        F: FnOnce(&mut RbacConfigFile) -> Result<(), String>,
+        F: FnOnce(&mut RbacConfigFile) -> Result<M, String>,
+        S: FnOnce(&RbacRuntimeState, M) -> Result<T, String>,
     {
-        let (source_path, mut config) = {
-            let state = self
-                .state
-                .read()
-                .expect("RBAC registry state lock should not be poisoned");
-            (state.source_path.clone(), state.config.clone())
-        };
-        mutator(&mut config)?;
-        let state = build_runtime_state(config.clone(), source_path.clone())?;
-        if let Some(path) = source_path.as_ref() {
-            let raw = serde_json::to_vec_pretty(&config)
-                .map_err(|err| format!("failed to encode RBAC config: {err}"))?;
-            fs::write(path, raw)
-                .map_err(|err| format!("failed to write RBAC config {}: {err}", path.display()))?;
-        }
         let mut current = self
             .state
             .write()
             .expect("RBAC registry state lock should not be poisoned");
+        let source_path = current.source_path.clone();
+        let mut config = current.config.clone();
+        let mutation_result = mutator(&mut config)?;
+        let state = build_runtime_state(config.clone(), source_path.clone())?;
+        let persisted_warning = if let Some(path) = source_path.as_ref() {
+            let raw = serde_json::to_vec_pretty(&config)
+                .map_err(|err| format!("failed to encode RBAC config: {err}"))?;
+            persist_rbac_config(path, &raw)?
+        } else {
+            None
+        };
+        let result = selector(&state, mutation_result)?;
         *current = state;
-        Ok(())
-    }
-
-    fn service_account_snapshot(&self, id: &str) -> Option<RbacServiceAccountSnapshot> {
-        let state = self
-            .state
-            .read()
-            .expect("RBAC registry state lock should not be poisoned");
-        let service_account = state.service_accounts.get(id)?;
-        Some(RbacServiceAccountSnapshot {
-            id: id.to_string(),
-            description: service_account.description.clone(),
-            disabled: service_account.disabled,
-            created_unix_ms: service_account.created_unix_ms,
-            updated_unix_ms: service_account.updated_unix_ms,
-            last_rotated_unix_ms: service_account.last_rotated_unix_ms,
-            bindings: bindings_to_snapshots(&service_account.bindings),
-        })
-    }
-
-    fn generate_unique_service_account_token(&self) -> Result<String, String> {
-        let random = SystemRandom::new();
-        for _ in 0..32 {
-            let mut bytes = [0_u8; SERVICE_ACCOUNT_TOKEN_BYTES];
-            random
-                .fill(&mut bytes)
-                .map_err(|_| "failed to generate service account token".to_string())?;
-            let token = format!("tsa_{}", URL_SAFE_NO_PAD.encode(bytes));
-            let exists = {
-                let state = self
-                    .state
-                    .read()
-                    .expect("RBAC registry state lock should not be poisoned");
-                state.token_index.contains_key(&token)
-            };
-            if !exists {
-                return Ok(token);
-            }
+        if let Some(err) = persisted_warning {
+            return Err(err);
         }
-        Err("failed to generate a unique service account token".to_string())
+        Ok(result)
     }
 
     fn record_allow(&self, permission: &RbacPermission, authorized: &AuthorizedPrincipal) {
@@ -1112,6 +1089,67 @@ impl RbacRegistry {
         }
         audit.push_back(entry);
     }
+}
+
+fn persist_rbac_config(path: &Path, raw: &[u8]) -> Result<Option<String>, String> {
+    match write_file_atomically_and_sync_parent(path, raw) {
+        Ok(()) => Ok(None),
+        Err(err) => match fs::read(path) {
+            Ok(existing) if existing == raw => Ok(Some(format!(
+                "RBAC config {} was updated but could not be fully synced: {err}",
+                path.display()
+            ))),
+            Ok(_) => Err(format!(
+                "failed to write RBAC config {}: {err}",
+                path.display()
+            )),
+            Err(read_err) => Err(format!(
+                "failed to write RBAC config {}: {err}; failed to verify persisted contents: {read_err}",
+                path.display()
+            )),
+        },
+    }
+}
+
+fn service_account_snapshot_from_state(
+    state: &RbacRuntimeState,
+    id: &str,
+) -> Option<RbacServiceAccountSnapshot> {
+    let service_account = state.service_accounts.get(id)?;
+    Some(RbacServiceAccountSnapshot {
+        id: id.to_string(),
+        description: service_account.description.clone(),
+        disabled: service_account.disabled,
+        created_unix_ms: service_account.created_unix_ms,
+        updated_unix_ms: service_account.updated_unix_ms,
+        last_rotated_unix_ms: service_account.last_rotated_unix_ms,
+        bindings: bindings_to_snapshots(&service_account.bindings),
+    })
+}
+
+fn generate_unique_service_account_token_for_config(
+    config: &RbacConfigFile,
+) -> Result<String, String> {
+    let random = SystemRandom::new();
+    for _ in 0..32 {
+        let mut bytes = [0_u8; SERVICE_ACCOUNT_TOKEN_BYTES];
+        random
+            .fill(&mut bytes)
+            .map_err(|_| "failed to generate service account token".to_string())?;
+        let token = format!("tsa_{}", URL_SAFE_NO_PAD.encode(bytes));
+        let principal_conflict = config
+            .principals
+            .iter()
+            .any(|principal| principal.token.trim() == token);
+        let service_account_conflict = config
+            .service_accounts
+            .iter()
+            .any(|service_account| service_account.token.trim() == token);
+        if !principal_conflict && !service_account_conflict {
+            return Ok(token);
+        }
+    }
+    Err("failed to generate a unique service account token".to_string())
 }
 
 fn build_runtime_state(
@@ -1897,6 +1935,8 @@ mod tests {
     use super::*;
     use ring::hmac;
     use serde_json::json;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::TempDir;
 
     #[test]
@@ -2126,6 +2166,30 @@ mod tests {
         assert_eq!(denied.code(), "auth_scope_denied");
     }
 
+    fn write_service_account_config(
+        config_path: &std::path::Path,
+        service_accounts: Vec<JsonValue>,
+    ) {
+        fs::write(
+            config_path,
+            serde_json::to_string_pretty(&json!({
+                "roles": {
+                    "tenant-reader": {
+                        "grants": [
+                            {
+                                "action": "read",
+                                "resource": { "kind": "tenant", "name": "*" }
+                            }
+                        ]
+                    }
+                },
+                "serviceAccounts": service_accounts,
+            }))
+            .expect("RBAC config should encode"),
+        )
+        .expect("RBAC config should be written");
+    }
+
     #[test]
     fn service_account_lifecycle_persists_and_audits() {
         let temp_dir = TempDir::new().expect("tempdir should be created");
@@ -2211,6 +2275,209 @@ mod tests {
         assert!(audit
             .iter()
             .any(|entry| entry.code == "service_account_disabled"));
+    }
+
+    #[test]
+    fn concurrent_service_account_creates_preserve_all_accounts() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let config_path = temp_dir.path().join("rbac.json");
+        write_service_account_config(&config_path, Vec::new());
+
+        let registry = Arc::new(
+            RbacRegistry::load_from_path(&config_path).expect("RBAC registry should load"),
+        );
+        let rounds = 3;
+        let workers = 8;
+        let mut expected_ids = Vec::new();
+
+        for round in 0..rounds {
+            let barrier = Arc::new(Barrier::new(workers));
+            let mut handles = Vec::new();
+            for worker in 0..workers {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                let id = format!("bot-{round}-{worker}");
+                expected_ids.push(id.clone());
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    registry.create_service_account(ServiceAccountSpec {
+                        id,
+                        description: None,
+                        disabled: false,
+                        bindings: vec![RbacBindingSnapshot {
+                            role: "tenant-reader".to_string(),
+                            scopes: vec![RbacResource::tenant("team-a")],
+                        }],
+                    })
+                }));
+            }
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("creator thread should not panic")
+                    .expect("service account create should succeed");
+            }
+        }
+
+        expected_ids.sort();
+
+        let mut snapshot_ids = registry
+            .state_snapshot()
+            .service_accounts
+            .into_iter()
+            .map(|service_account| service_account.id)
+            .collect::<Vec<_>>();
+        snapshot_ids.sort();
+        assert_eq!(snapshot_ids, expected_ids);
+
+        let persisted: JsonValue = serde_json::from_str(
+            &fs::read_to_string(&config_path).expect("config should be readable"),
+        )
+        .expect("config should remain valid JSON");
+        let mut persisted_ids = persisted["serviceAccounts"]
+            .as_array()
+            .expect("service accounts should be serialized")
+            .iter()
+            .map(|service_account| {
+                service_account["id"]
+                    .as_str()
+                    .expect("service account id should be a string")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        persisted_ids.sort();
+        assert_eq!(persisted_ids, expected_ids);
+    }
+
+    #[test]
+    fn concurrent_rotate_and_disable_preserve_each_change() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let config_path = temp_dir.path().join("rbac.json");
+        let rotate_accounts = (0..4)
+            .map(|index| (format!("rotate-{index}"), format!("rotate-token-{index}")))
+            .collect::<Vec<_>>();
+        let disable_accounts = (0..4)
+            .map(|index| (format!("disable-{index}"), format!("disable-token-{index}")))
+            .collect::<Vec<_>>();
+        let mut service_accounts = Vec::new();
+        for (id, token) in rotate_accounts.iter().chain(disable_accounts.iter()) {
+            service_accounts.push(json!({
+                "id": id,
+                "token": token,
+                "bindings": [
+                    {
+                        "role": "tenant-reader",
+                        "scopes": [
+                            { "kind": "tenant", "name": "team-a" }
+                        ]
+                    }
+                ]
+            }));
+        }
+        write_service_account_config(&config_path, service_accounts);
+
+        let registry = Arc::new(
+            RbacRegistry::load_from_path(&config_path).expect("RBAC registry should load"),
+        );
+        let barrier = Arc::new(Barrier::new(rotate_accounts.len() + disable_accounts.len()));
+        let mut rotate_handles = Vec::new();
+        let mut disable_handles = Vec::new();
+
+        for (id, old_token) in rotate_accounts.clone() {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            rotate_handles.push(thread::spawn(move || {
+                barrier.wait();
+                registry
+                    .rotate_service_account(&id)
+                    .map(|credential| (id, old_token, credential))
+            }));
+        }
+        for (id, old_token) in disable_accounts.clone() {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            disable_handles.push(thread::spawn(move || {
+                barrier.wait();
+                registry
+                    .set_service_account_disabled(&id, true)
+                    .map(|snapshot| (id, old_token, snapshot))
+            }));
+        }
+
+        let mut rotated = Vec::new();
+        let mut disabled = Vec::new();
+        for handle in rotate_handles {
+            rotated.push(
+                handle
+                    .join()
+                    .expect("rotate thread should not panic")
+                    .expect("rotate should succeed"),
+            );
+        }
+        for handle in disable_handles {
+            disabled.push(
+                handle
+                    .join()
+                    .expect("disable thread should not panic")
+                    .expect("disable should succeed"),
+            );
+        }
+
+        for (id, old_token, credential) in rotated {
+            assert_ne!(credential.token, old_token);
+            registry
+                .authorize(
+                    Some(&credential.token),
+                    &RbacPermission::new(RbacAction::Read, RbacResource::tenant("team-a")),
+                )
+                .expect("rotated token should authorize");
+            let denied = registry
+                .authorize(
+                    Some(&old_token),
+                    &RbacPermission::new(RbacAction::Read, RbacResource::tenant("team-a")),
+                )
+                .expect_err("old token should be rejected");
+            assert_eq!(denied.code(), "auth_token_invalid");
+            assert_eq!(credential.service_account.id, id);
+        }
+
+        for (id, old_token, snapshot) in disabled {
+            assert!(snapshot.disabled, "disabled snapshot should stay disabled");
+            assert_eq!(snapshot.id, id);
+            let denied = registry
+                .authorize(
+                    Some(&old_token),
+                    &RbacPermission::new(RbacAction::Read, RbacResource::tenant("team-a")),
+                )
+                .expect_err("disabled token should be rejected");
+            assert_eq!(denied.code(), "auth_principal_disabled");
+        }
+
+        let persisted: JsonValue = serde_json::from_str(
+            &fs::read_to_string(&config_path).expect("config should be readable"),
+        )
+        .expect("config should remain valid JSON");
+        let persisted_accounts = persisted["serviceAccounts"]
+            .as_array()
+            .expect("service accounts should be serialized");
+        for (id, old_token) in rotate_accounts {
+            let account = persisted_accounts
+                .iter()
+                .find(|service_account| service_account["id"].as_str() == Some(id.as_str()))
+                .expect("rotated account should persist");
+            assert_ne!(
+                account["token"].as_str(),
+                Some(old_token.as_str()),
+                "rotated token should persist",
+            );
+        }
+        for (id, _) in disable_accounts {
+            let account = persisted_accounts
+                .iter()
+                .find(|service_account| service_account["id"].as_str() == Some(id.as_str()))
+                .expect("disabled account should persist");
+            assert_eq!(account["disabled"].as_bool(), Some(true));
+        }
     }
 
     fn encode_hs256_jwt(header: &JsonValue, claims: &JsonValue, secret: &[u8]) -> String {

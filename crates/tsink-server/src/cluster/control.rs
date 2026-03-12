@@ -2,10 +2,10 @@ use crate::cluster::membership::MembershipView;
 use crate::cluster::ring::{ring_hash_version_name, ShardRing, ShardRingSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tsink::engine::fs_utils::write_file_atomically_and_sync_parent;
 
 pub const CONTROL_STATE_SCHEMA_VERSION: u16 = 1;
 const CONTROL_STATE_MAGIC: &str = "tsink-control-state";
@@ -1065,7 +1065,45 @@ fn materialize_shard_owner(owners: &mut Vec<String>, from_node_id: &str, to_node
 
 #[derive(Debug, Clone)]
 pub struct ControlStateStore {
+    inner: Arc<ControlStateStoreInner>,
+}
+
+#[derive(Debug)]
+struct ControlStateStoreInner {
     path: PathBuf,
+    write_state: Mutex<ControlStateStoreWriteState>,
+}
+
+#[derive(Debug, Default)]
+struct ControlStateStoreWriteState {
+    latest_persisted_version: Option<ControlStatePersistenceVersion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ControlStatePersistenceVersion {
+    applied_log_index: u64,
+    applied_log_term: u64,
+    membership_epoch: u64,
+    ring_version: u64,
+    updated_unix_ms: u64,
+}
+
+impl From<&ControlState> for ControlStatePersistenceVersion {
+    fn from(state: &ControlState) -> Self {
+        Self {
+            applied_log_index: state.applied_log_index,
+            applied_log_term: state.applied_log_term,
+            membership_epoch: state.membership_epoch,
+            ring_version: state.ring_version,
+            updated_unix_ms: state.updated_unix_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlStatePersistMode {
+    Monotonic,
+    ReplaceCurrent,
 }
 
 #[derive(Debug, Clone)]
@@ -1091,11 +1129,16 @@ impl ControlStateStore {
                 )
             })?;
         }
-        Ok(Self { path })
+        Ok(Self {
+            inner: Arc::new(ControlStateStoreInner {
+                path,
+                write_state: Mutex::new(ControlStateStoreWriteState::default()),
+            }),
+        })
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
 
     #[allow(dead_code)]
@@ -1115,36 +1158,29 @@ impl ControlStateStore {
     }
 
     pub fn persist(&self, state: &ControlState) -> Result<(), String> {
-        state.validate()?;
+        self.persist_internal(state, ControlStatePersistMode::Monotonic)
+    }
 
-        let envelope = ControlStateEnvelopeV1 {
-            magic: CONTROL_STATE_MAGIC.to_string(),
-            schema_version: CONTROL_STATE_SCHEMA_VERSION,
-            state: state.clone(),
-        };
-        let mut encoded = serde_json::to_vec_pretty(&envelope)
-            .map_err(|err| format!("failed to serialize control state: {err}"))?;
-        encoded.push(b'\n');
-        write_atomically(&self.path, &encoded)?;
-        Ok(())
+    pub fn replace(&self, state: &ControlState) -> Result<(), String> {
+        self.persist_internal(state, ControlStatePersistMode::ReplaceCurrent)
     }
 
     fn load_internal(&self) -> Result<Option<LoadedControlState>, String> {
-        if !self.path.exists() {
+        if !self.inner.path.exists() {
             return Ok(None);
         }
 
-        let raw = std::fs::read(&self.path).map_err(|err| {
+        let raw = std::fs::read(&self.inner.path).map_err(|err| {
             format!(
                 "failed to read control-state file {}: {err}",
-                self.path.display()
+                self.inner.path.display()
             )
         })?;
 
         let json: serde_json::Value = serde_json::from_slice(&raw).map_err(|err| {
             format!(
                 "failed to parse control-state file {}: {err}",
-                self.path.display()
+                self.inner.path.display()
             )
         })?;
 
@@ -1154,13 +1190,13 @@ impl ControlStateStore {
             .ok_or_else(|| {
                 format!(
                     "control-state file {} is missing 'magic' header",
-                    self.path.display()
+                    self.inner.path.display()
                 )
             })?;
         if magic != CONTROL_STATE_MAGIC {
             return Err(format!(
                 "control-state file {} has unsupported magic header '{}'",
-                self.path.display(),
+                self.inner.path.display(),
                 magic
             ));
         }
@@ -1171,13 +1207,13 @@ impl ControlStateStore {
             .ok_or_else(|| {
                 format!(
                     "control-state file {} is missing numeric 'schemaVersion'",
-                    self.path.display()
+                    self.inner.path.display()
                 )
             })?;
         if schema_version > u16::MAX as u64 {
             return Err(format!(
                 "control-state file {} has schemaVersion {} which exceeds supported range",
-                self.path.display(),
+                self.inner.path.display(),
                 schema_version
             ));
         }
@@ -1187,7 +1223,7 @@ impl ControlStateStore {
             return Err(format!(
                 "unsupported control-state schema version {} in {} (expected {})",
                 schema_version,
-                self.path.display(),
+                self.inner.path.display(),
                 CONTROL_STATE_SCHEMA_VERSION
             ));
         }
@@ -1196,7 +1232,7 @@ impl ControlStateStore {
                 format!(
                     "failed to decode control-state schema v{} from {}: {err}",
                     CONTROL_STATE_SCHEMA_VERSION,
-                    self.path.display()
+                    self.inner.path.display()
                 )
             })?;
             envelope.state
@@ -1205,44 +1241,59 @@ impl ControlStateStore {
         state.validate().map_err(|err| {
             format!(
                 "control-state validation failed for {}: {err}",
-                self.path.display()
+                self.inner.path.display()
             )
         })?;
 
         Ok(Some(LoadedControlState { state }))
     }
+
+    fn persist_internal(
+        &self,
+        state: &ControlState,
+        mode: ControlStatePersistMode,
+    ) -> Result<(), String> {
+        state.validate()?;
+
+        let envelope = ControlStateEnvelopeV1 {
+            magic: CONTROL_STATE_MAGIC.to_string(),
+            schema_version: CONTROL_STATE_SCHEMA_VERSION,
+            state: state.clone(),
+        };
+        let mut encoded = serde_json::to_vec_pretty(&envelope)
+            .map_err(|err| format!("failed to serialize control state: {err}"))?;
+        encoded.push(b'\n');
+        let candidate_version = ControlStatePersistenceVersion::from(state);
+
+        let mut write_state = self
+            .inner
+            .write_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if write_state.latest_persisted_version.is_none() {
+            write_state.latest_persisted_version = self
+                .load_internal()?
+                .map(|loaded| ControlStatePersistenceVersion::from(&loaded.state));
+        }
+        if mode == ControlStatePersistMode::Monotonic
+            && write_state
+                .latest_persisted_version
+                .is_some_and(|current| candidate_version < current)
+        {
+            return Ok(());
+        }
+
+        write_atomically(&self.inner.path, &encoded)?;
+        write_state.latest_persisted_version = Some(candidate_version);
+        Ok(())
+    }
 }
 
 fn write_atomically(path: &Path, encoded: &[u8]) -> Result<(), String> {
-    let tmp_path = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(|err| {
-            format!(
-                "failed to open temporary control-state file {}: {err}",
-                tmp_path.display()
-            )
-        })?;
-    file.write_all(encoded).map_err(|err| {
+    write_file_atomically_and_sync_parent(path, encoded).map_err(|err| {
         format!(
-            "failed to write temporary control-state file {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    file.sync_all().map_err(|err| {
-        format!(
-            "failed to fsync temporary control-state file {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
-            "failed to replace control-state file {} with {}: {err}",
-            path.display(),
-            tmp_path.display()
+            "failed to persist control-state file {}: {err}",
+            path.display()
         )
     })
 }
@@ -1260,6 +1311,8 @@ mod tests {
     use crate::cluster::config::ClusterConfig;
     use crate::cluster::membership::MembershipView;
     use crate::cluster::ring::{ShardRingSnapshot, CURRENT_RING_HASH_VERSION};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::TempDir;
 
     fn sample_membership_and_ring() -> (MembershipView, ShardRing) {
@@ -1753,6 +1806,58 @@ mod tests {
         assert_eq!(snapshot.final_sync_shards, 1);
         assert_eq!(snapshot.copied_rows_total, 90);
         assert_eq!(snapshot.pending_rows_total, 4);
+    }
+
+    #[test]
+    fn concurrent_persist_keeps_newest_state() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let state_path = temp_dir.path().join("cluster").join("control-state.json");
+        let store = Arc::new(ControlStateStore::open(state_path).expect("store should open"));
+        let (membership, ring) = sample_membership_and_ring();
+        let initial = ControlState::from_runtime(&membership, &ring);
+        store
+            .persist(&initial)
+            .expect("initial state should persist");
+
+        let stale = initial.clone();
+        let mut newer = initial.clone();
+        newer
+            .apply_join_node("node-c", "127.0.0.1:9303")
+            .expect("join should succeed");
+        newer.applied_log_index = stale.applied_log_index.saturating_add(1);
+        newer.applied_log_term = stale.applied_log_term.saturating_add(1);
+        newer.updated_unix_ms = stale.updated_unix_ms.saturating_add(1);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let stale_store = Arc::clone(&store);
+        let stale_barrier = Arc::clone(&barrier);
+        let stale_thread = thread::spawn(move || {
+            stale_barrier.wait();
+            stale_store.persist(&stale)
+        });
+        let newer_store = Arc::clone(&store);
+        let newer_barrier = Arc::clone(&barrier);
+        let newer_state = newer.clone();
+        let newer_thread = thread::spawn(move || {
+            newer_barrier.wait();
+            newer_store.persist(&newer_state)
+        });
+
+        barrier.wait();
+        stale_thread
+            .join()
+            .expect("stale persist thread should join")
+            .expect("stale persist should not corrupt state");
+        newer_thread
+            .join()
+            .expect("newer persist thread should join")
+            .expect("newer persist should succeed");
+
+        let recovered = store
+            .load()
+            .expect("load should succeed")
+            .expect("state should exist");
+        assert_eq!(recovered, newer);
     }
 
     #[test]

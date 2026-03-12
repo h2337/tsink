@@ -338,7 +338,7 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn write_file_atomically_and_sync_parent(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_file_atomically_and_sync_parent(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp_path = write_tmp_and_sync(path, bytes)?;
     if let Err(err) = rename_tmp(&tmp_path, path) {
         let _ = remove_file_if_exists(&tmp_path);

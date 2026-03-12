@@ -229,18 +229,18 @@ pub enum ReadFanoutError {
     RemoteSelectSeries {
         node_id: String,
         endpoint: String,
-        source: RpcError,
+        source: Box<RpcError>,
     },
     RemoteListMetrics {
         node_id: String,
         endpoint: String,
-        source: RpcError,
+        source: Box<RpcError>,
     },
     RemoteSelectBatch {
         node_id: String,
         endpoint: String,
         series_count: usize,
-        source: RpcError,
+        source: Box<RpcError>,
     },
     MergeLimitExceeded {
         message: String,
@@ -385,7 +385,16 @@ impl fmt::Display for ReadFanoutError {
     }
 }
 
-impl std::error::Error for ReadFanoutError {}
+impl std::error::Error for ReadFanoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RemoteSelectSeries { source, .. }
+            | Self::RemoteListMetrics { source, .. }
+            | Self::RemoteSelectBatch { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 static CLUSTER_FANOUT_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_FANOUT_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1377,7 +1386,7 @@ impl ReadFanoutExecutor {
                         ReadFanoutError::RemoteSelectSeries {
                             node_id,
                             endpoint,
-                            source,
+                            source: Box::new(source),
                         }
                     }),
                 }
@@ -1440,7 +1449,7 @@ impl ReadFanoutExecutor {
                         .map_err(|source| ReadFanoutError::RemoteListMetrics {
                             node_id,
                             endpoint,
-                            source,
+                            source: Box::new(source),
                         }),
                 }
             });
@@ -1564,7 +1573,7 @@ async fn remote_select_points_batch_with_legacy_fallback(
                 node_id: node_id.to_string(),
                 endpoint: endpoint.to_string(),
                 series_count: series.len(),
-                source,
+                source: Box::new(source),
             });
         }
     }
@@ -1597,7 +1606,7 @@ async fn remote_select_points_batch_with_legacy_fallback(
                     node_id: node_id.to_string(),
                     endpoint: endpoint.to_string(),
                     series_count: 1,
-                    source,
+                    source: Box::new(source),
                 });
             }
         }

@@ -4,6 +4,8 @@ tsink ships Python bindings via [UniFFI](https://mozilla.github.io/uniffi-rs/).
 The `tsink` package gives you the full storage engine — writes, queries,
 aggregation, rollups, snapshots — from Python with no server process required.
 After installation, import it as `tsink`.
+UniFFI record types such as `Label`, `Row`, and `MetricSeries` use keyword-only
+constructors in Python.
 
 ## Installation
 
@@ -37,12 +39,17 @@ db = builder.build()
 db.insert_rows([
     Row(
         metric="cpu_usage",
-        labels=[Label("host", "web-1")],
+        labels=[Label(name="host", value="web-1")],
         data_point=DataPoint(timestamp=1_700_000_000_000, value=Value.F64(v=42.0)),
     ),
 ])
 
-points = db.select("cpu_usage", [Label("host", "web-1")], 0, 2_000_000_000_000)
+points = db.select(
+    "cpu_usage",
+    [Label(name="host", value="web-1")],
+    0,
+    2_000_000_000_000,
+)
 for p in points:
     print(f"ts={p.timestamp} value={p.value}")
 
@@ -178,12 +185,15 @@ Value.HISTOGRAM(v=histogram)   # native Prometheus histogram
 rows = [
     Row(
         metric="http_requests_total",
-        labels=[Label("method", "GET"), Label("status", "200")],
+        labels=[
+            Label(name="method", value="GET"),
+            Label(name="status", value="200"),
+        ],
         data_point=DataPoint(timestamp=1_700_000_000_000, value=Value.F64(v=1027.0)),
     ),
     Row(
         metric="memory_free_bytes",
-        labels=[Label("host", "web-1")],
+        labels=[Label(name="host", value="web-1")],
         data_point=DataPoint(timestamp=1_700_000_000_000, value=Value.I64(v=8_589_934_592)),
     ),
 ]
@@ -211,7 +221,12 @@ print(result.acknowledgement)
 #### Simple select
 
 ```python
-points = db.select("cpu_usage", [Label("host", "web-1")], start=0, end=2_000_000_000_000)
+points = db.select(
+    "cpu_usage",
+    [Label(name="host", value="web-1")],
+    start=0,
+    end=2_000_000_000_000,
+)
 
 for p in points:
     print(p.timestamp, p.value)
@@ -241,8 +256,8 @@ Returns a list of `LabeledDataPoints`, each carrying `labels` and `data_points`.
 from tsink import MetricSeries
 
 series = [
-    MetricSeries(name="cpu_usage", labels=[Label("host", "web-1")]),
-    MetricSeries(name="cpu_usage", labels=[Label("host", "web-2")]),
+    MetricSeries(name="cpu_usage", labels=[Label(name="host", value="web-1")]),
+    MetricSeries(name="cpu_usage", labels=[Label(name="host", value="web-2")]),
 ]
 
 results = db.select_many(series, start=0, end=2_000_000_000_000)
@@ -256,7 +271,7 @@ for sp in results:
 from tsink import Aggregation, DownsampleOptions, QueryOptions
 
 options = QueryOptions(
-    labels=[Label("host", "web-1")],
+    labels=[Label(name="host", value="web-1")],
     start=0,
     end=2_000_000_000_000,
     aggregation=Aggregation.AVG,

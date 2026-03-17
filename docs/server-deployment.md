@@ -418,7 +418,7 @@ spec:
     spec:
       containers:
         - name: tsink
-          image: your-registry/tsink-server:0.10.0
+          image: your-registry/tsink-server:0.10.1
           args:
             - --listen=0.0.0.0:9201
             - --data-path=/data

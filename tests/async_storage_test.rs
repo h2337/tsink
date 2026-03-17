@@ -6,8 +6,9 @@ use tokio::sync::Notify;
 
 use tempfile::TempDir;
 use tsink::{
-    Aggregation, AsyncStorage, AsyncStorageBuilder, DataPoint, Label, QueryOptions, Result, Row,
-    Storage, StorageBuilder, TsinkError, WalSyncMode, WriteAcknowledgement,
+    Aggregation, AsyncStorage, AsyncStorageBuilder, DataPoint, Label, QueryOptions, Result,
+    RollupPolicy, Row, Storage, StorageBuilder, TimestampPrecision, TsinkError, WalSyncMode,
+    WriteAcknowledgement,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -117,6 +118,23 @@ async fn close_then_operations_error_with_storage_closed() -> Result<()> {
         storage.list_metrics().await,
         Err(TsinkError::StorageClosed)
     ));
+    assert!(matches!(
+        storage
+            .apply_rollup_policies(vec![RollupPolicy {
+                id: "closed_policy".to_string(),
+                metric: "closed_metric".to_string(),
+                match_labels: Vec::new(),
+                interval: 60,
+                aggregation: Aggregation::Avg,
+                bucket_origin: 0,
+            }])
+            .await,
+        Err(TsinkError::StorageClosed)
+    ));
+    assert!(matches!(
+        storage.trigger_rollup_run().await,
+        Err(TsinkError::StorageClosed)
+    ));
 
     Ok(())
 }
@@ -177,6 +195,73 @@ async fn async_snapshot_restore_roundtrip() -> Result<()> {
         restored.close().await?;
     }
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_rollup_policy_management_roundtrip() -> Result<()> {
+    let dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "a")];
+    let storage = AsyncStorageBuilder::new()
+        .with_data_path(dir.path())
+        .with_timestamp_precision(TimestampPrecision::Milliseconds)
+        .build()?;
+
+    storage
+        .insert_rows(vec![
+            Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(0, 1.0)),
+            Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(1_000, 2.0)),
+            Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(2_000, 3.0)),
+        ])
+        .await?;
+
+    let snapshot = storage
+        .apply_rollup_policies(vec![RollupPolicy {
+            id: "cpu_1s_avg".to_string(),
+            metric: "cpu_usage".to_string(),
+            match_labels: Vec::new(),
+            interval: 1_000,
+            aggregation: Aggregation::Avg,
+            bucket_origin: 0,
+        }])
+        .await?;
+    assert_eq!(snapshot.policies.len(), 1);
+    assert_eq!(snapshot.policies[0].policy.id, "cpu_1s_avg");
+    assert_eq!(snapshot.policies[0].matched_series, 1);
+    assert_eq!(snapshot.policies[0].materialized_series, 1);
+    assert_eq!(snapshot.policies[0].materialized_through, Some(2_000));
+
+    storage
+        .insert_rows(vec![Row::with_labels(
+            "cpu_usage",
+            labels.clone(),
+            DataPoint::new(3_000, 4.0),
+        )])
+        .await?;
+
+    let rerun = storage.trigger_rollup_run().await?;
+    assert_eq!(rerun.policies.len(), 1);
+    assert_eq!(rerun.policies[0].materialized_through, Some(3_000));
+
+    let points = storage
+        .select_with_options(
+            "cpu_usage",
+            QueryOptions::new(0, 4_000)
+                .with_labels(labels)
+                .with_downsample(1_000, Aggregation::Avg),
+        )
+        .await?;
+    assert_eq!(
+        points,
+        vec![
+            DataPoint::new(0, 1.0),
+            DataPoint::new(1_000, 2.0),
+            DataPoint::new(2_000, 3.0),
+            DataPoint::new(3_000, 4.0),
+        ]
+    );
+
+    storage.close().await?;
     Ok(())
 }
 

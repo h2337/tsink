@@ -3,8 +3,9 @@
 use crate::cgroup;
 use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{
-    DataPoint, Label, MetricSeries, QueryOptions, QueryRowsPage, QueryRowsScanOptions, Result, Row,
-    SeriesSelection, Storage, StorageBuilder, TimestampPrecision, TsinkError, WriteResult,
+    DataPoint, Label, MetricSeries, QueryOptions, QueryRowsPage, QueryRowsScanOptions, Result,
+    RollupObservabilitySnapshot, RollupPolicy, Row, SeriesSelection, Storage, StorageBuilder,
+    TimestampPrecision, TsinkError, WriteResult,
 };
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,13 @@ enum WriteCommand {
     Snapshot {
         path: PathBuf,
         reply: Reply<()>,
+    },
+    ApplyRollupPolicies {
+        policies: Vec<RollupPolicy>,
+        reply: Reply<RollupObservabilitySnapshot>,
+    },
+    TriggerRollupRun {
+        reply: Reply<RollupObservabilitySnapshot>,
     },
     Close {
         reply: Reply<()>,
@@ -361,6 +369,31 @@ impl AsyncStorage {
         self.runtime.storage.memory_budget()
     }
 
+    pub async fn apply_rollup_policies(
+        &self,
+        policies: Vec<RollupPolicy>,
+    ) -> Result<RollupObservabilitySnapshot> {
+        self.ensure_open()?;
+        let (reply, recv) = reply_channel();
+        self.runtime
+            .write_tx
+            .send(WriteCommand::ApplyRollupPolicies { policies, reply })
+            .await
+            .map_err(|_| runtime_stopped_error())?;
+        recv_reply(recv).await
+    }
+
+    pub async fn trigger_rollup_run(&self) -> Result<RollupObservabilitySnapshot> {
+        self.ensure_open()?;
+        let (reply, recv) = reply_channel();
+        self.runtime
+            .write_tx
+            .send(WriteCommand::TriggerRollupRun { reply })
+            .await
+            .map_err(|_| runtime_stopped_error())?;
+        recv_reply(recv).await
+    }
+
     /// Writes an atomic on-disk snapshot to `path`.
     pub async fn snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
         self.ensure_open()?;
@@ -581,6 +614,14 @@ fn write_worker_loop(
             }
             WriteCommand::Snapshot { path, reply } => {
                 let result = storage.snapshot(&path);
+                let _ = reply.send_blocking(result);
+            }
+            WriteCommand::ApplyRollupPolicies { policies, reply } => {
+                let result = storage.apply_rollup_policies(policies);
+                let _ = reply.send_blocking(result);
+            }
+            WriteCommand::TriggerRollupRun { reply } => {
+                let result = storage.trigger_rollup_run();
                 let _ = reply.send_blocking(result);
             }
             WriteCommand::Close { reply } => {

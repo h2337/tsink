@@ -1963,7 +1963,7 @@ mod tests {
         write_test_file(&client_cert_path, TEST_INTERNAL_MTLS_CLIENT_A_CERT_PEM);
         write_test_file(&client_key_path, TEST_INTERNAL_MTLS_CLIENT_A_KEY_PEM);
 
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind("localhost:0")
             .await
             .expect("listener should bind");
         let addr = listener

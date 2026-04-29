@@ -32,14 +32,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
-    name: Tests
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            test_command: cargo test --workspace --all-features
+          - os: windows-latest
+            test_command: cargo test --workspace --all-features
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Tests (all features)
-        run: cargo test --workspace --all-features
+      - name: Tests
+        run: ${{ matrix.test_command }}
 
   measure-bpp:
     name: Measure BPP (quick)

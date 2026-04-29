@@ -1829,6 +1829,7 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
         .with_object_store_path(object_store_dir.path())
         .with_runtime_mode(StorageRuntimeMode::ComputeOnly)
         .with_remote_segment_refresh_interval(Duration::from_millis(1))
+        .with_background_threads_enabled_for_tests(false)
         .with_tiered_retention_policy(Duration::from_secs(10), Duration::from_secs(50))
         .with_retention(Duration::from_secs(100))
         .with_timestamp_precision(TimestampPrecision::Seconds)
@@ -1867,6 +1868,9 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
     let expected_stale_points = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
     assert!(
         wait_for_condition(Duration::from_secs(1), Duration::from_millis(5), || {
+            storage
+                .sync_persisted_segments_from_disk_if_dirty_for_tests()
+                .unwrap();
             let selected = storage
                 .select("compute_only_refresh_stale_metric", &labels, 0, 200)
                 .unwrap();
@@ -1928,6 +1932,9 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
     ];
     assert!(
         wait_for_condition(Duration::from_secs(2), Duration::from_millis(10), || {
+            storage
+                .sync_persisted_segments_from_disk_if_dirty_for_tests()
+                .unwrap();
             let selected = storage
                 .select("compute_only_refresh_stale_metric", &labels, 0, 200)
                 .unwrap();

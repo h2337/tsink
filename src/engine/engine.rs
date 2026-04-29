@@ -398,6 +398,11 @@ impl Storage for ChunkStorage {
         self.select_series_api(selection)
     }
 
+    #[cfg(test)]
+    fn sync_persisted_segments_from_disk_if_dirty_for_tests(&self) -> Result<()> {
+        self.sync_persisted_segments_from_disk_if_dirty()
+    }
+
     fn select_series_in_shards(
         &self,
         selection: &SeriesSelection,

@@ -293,7 +293,51 @@ pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
 }
 
 pub(crate) fn rename_tmp(tmp_path: &Path, path: &Path) -> Result<()> {
-    std::fs::rename(tmp_path, path)?;
+    rename_tmp_impl(tmp_path, path)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn rename_tmp_impl(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp_path, path)
+}
+
+#[cfg(windows)]
+fn rename_tmp_impl(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path contains an interior NUL byte: {}", path.display()),
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let source = wide_path(tmp_path)?;
+    let destination = wide_path(path)?;
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    let moved = unsafe { move_file_ex_w(source.as_ptr(), destination.as_ptr(), flags) };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -318,6 +362,7 @@ pub(crate) fn rename_and_sync_parents(source: &Path, destination: &Path) -> Resu
     Ok(())
 }
 
+#[cfg(not(windows))]
 pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     let dir = std::fs::File::open(path).map_err(|source| TsinkError::IoWithPath {
         path: path.to_path_buf(),
@@ -329,6 +374,15 @@ pub(crate) fn sync_dir(path: &Path) -> Result<()> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    invoke_directory_sync_hook(path)?;
+    // Windows does not support flushing directory handles directly.
+    let _ = path;
+    Ok(())
 }
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {

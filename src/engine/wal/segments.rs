@@ -426,6 +426,7 @@ pub(super) fn write_published_highwater_marker(
     write_result
 }
 
+#[cfg(not(windows))]
 pub(super) fn sync_dir_path(path: &Path) -> Result<()> {
     let dir = File::open(path).map_err(|source| TsinkError::IoWithPath {
         path: path.to_path_buf(),
@@ -435,6 +436,12 @@ pub(super) fn sync_dir_path(path: &Path) -> Result<()> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(windows)]
+pub(super) fn sync_dir_path(_path: &Path) -> Result<()> {
+    // Windows does not support flushing directory handles directly.
+    Ok(())
 }
 
 pub(super) fn collect_wal_segment_files(dir: &Path) -> Result<Vec<WalSegmentFile>> {

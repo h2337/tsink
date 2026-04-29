@@ -677,6 +677,11 @@ pub trait Storage: Send + Sync {
         crate::query_selection::select_series_by_scan(self, selection)
     }
 
+    #[cfg(test)]
+    fn sync_persisted_segments_from_disk_if_dirty_for_tests(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Selects metric series by structured label matchers within a shard scope.
     ///
     /// Backends must override this to provide a bounded shard-scoped implementation.
@@ -1014,6 +1019,8 @@ pub struct StorageBuilder {
     background_fail_fast: bool,
     metadata_shard_count: Option<u32>,
     #[cfg(test)]
+    background_threads_enabled_override: Option<bool>,
+    #[cfg(test)]
     current_time_override: Option<i64>,
 }
 
@@ -1045,6 +1052,8 @@ impl Default for StorageBuilder {
             wal_replay_mode: WalReplayMode::Strict,
             background_fail_fast: true,
             metadata_shard_count: None,
+            #[cfg(test)]
+            background_threads_enabled_override: None,
             #[cfg(test)]
             current_time_override: None,
         }
@@ -1260,6 +1269,13 @@ impl StorageBuilder {
         self
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_background_threads_enabled_for_tests(mut self, enabled: bool) -> Self {
+        self.background_threads_enabled_override = Some(enabled);
+        self
+    }
+
     pub fn build(self) -> Result<Arc<dyn Storage>> {
         crate::engine::build_storage(self)
     }
@@ -1369,6 +1385,11 @@ impl StorageBuilder {
 
     pub(crate) fn metadata_shard_count(&self) -> Option<u32> {
         self.metadata_shard_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_threads_enabled_override_for_tests(&self) -> Option<bool> {
+        self.background_threads_enabled_override
     }
 
     #[cfg(test)]

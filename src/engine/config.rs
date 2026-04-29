@@ -162,7 +162,19 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
             wal_size_limit_bytes: builder.wal_size_limit_bytes().min(u64::MAX as usize) as u64,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
-            background_threads_enabled: has_data_path || needs_compute_only_refresh_worker,
+            background_threads_enabled: {
+                let enabled = has_data_path || needs_compute_only_refresh_worker;
+                #[cfg(test)]
+                {
+                    builder
+                        .background_threads_enabled_override_for_tests()
+                        .unwrap_or(enabled)
+                }
+                #[cfg(not(test))]
+                {
+                    enabled
+                }
+            },
             background_fail_fast: builder.background_fail_fast(),
             metadata_shard_count: builder.metadata_shard_count().filter(|count| *count > 0),
             remote_segment_cache_policy: builder.remote_segment_cache_policy(),

@@ -1,5 +1,5 @@
 use tempfile::TempDir;
-use tsink::{DataPoint, Row, StorageBuilder};
+use tsink::{DataPoint, Row, StorageBuilder, TimestampPrecision};
 
 #[test]
 fn test_simple_insert() {
@@ -17,6 +17,32 @@ fn test_simple_insert() {
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].timestamp, 1000);
     assert_eq!(points[0].value_as_f64().unwrap_or(f64::NAN), 1.0);
+}
+
+#[test]
+fn test_persistent_build_with_millisecond_precision() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Milliseconds)
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[Row::new(
+            "cpu_usage",
+            DataPoint::new(1_700_000_000_000_i64, 42.0),
+        )])
+        .unwrap();
+
+    let points = storage
+        .select("cpu_usage", &[], 1_700_000_000_000, 1_700_000_000_001)
+        .unwrap();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].timestamp, 1_700_000_000_000);
+    assert_eq!(points[0].value_as_f64().unwrap_or(f64::NAN), 42.0);
+
+    storage.close().unwrap();
 }
 
 #[test]

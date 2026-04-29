@@ -190,8 +190,10 @@ pub fn get_max_mmap_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::fs;
     use std::io::Write;
+    #[cfg(target_os = "linux")]
     use std::os::unix::io::AsRawFd;
     use tempfile::NamedTempFile;
 

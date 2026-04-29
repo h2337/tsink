@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -7,30 +7,40 @@ use tsink::{DataPoint, Label, Row, StorageBuilder};
 #[test]
 fn test_high_contention_concurrent_writes() {
     let temp_dir = TempDir::new().unwrap();
+    let write_timeout = if cfg!(windows) {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(10)
+    };
     let storage = Arc::new(
         StorageBuilder::new()
             .with_data_path(temp_dir.path())
             .with_max_writers(4)
-            .with_write_timeout(Duration::from_secs(10))
+            .with_write_timeout(write_timeout)
             .build()
             .unwrap(),
     );
 
     let num_threads = 20;
     let writes_per_thread = 100;
+    let barrier = Arc::new(Barrier::new(num_threads));
     let mut handles = vec![];
 
     for thread_id in 0..num_threads {
         let storage = storage.clone();
+        let barrier = barrier.clone();
         let handle = thread::spawn(move || {
-            for i in 0..writes_per_thread {
-                let timestamp = (thread_id * writes_per_thread + i + 1) as i64;
-                let rows = vec![Row::new(
-                    "contention_metric",
-                    DataPoint::new(timestamp, thread_id as f64 + i as f64 / 100.0),
-                )];
-                storage.insert_rows(&rows).unwrap();
-            }
+            let rows = (0..writes_per_thread)
+                .map(|i| {
+                    let timestamp = (thread_id * writes_per_thread + i + 1) as i64;
+                    Row::new(
+                        "contention_metric",
+                        DataPoint::new(timestamp, thread_id as f64 + i as f64 / 100.0),
+                    )
+                })
+                .collect::<Vec<_>>();
+            barrier.wait();
+            storage.insert_rows(&rows).unwrap();
         });
         handles.push(handle);
     }

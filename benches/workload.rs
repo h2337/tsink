@@ -519,10 +519,7 @@ impl WorkloadGenerator {
     }
 
     fn release_due_delayed_rows(&mut self, batch: &mut Vec<Row>) {
-        loop {
-            let Some((&due_step, _)) = self.delayed_rows.first_key_value() else {
-                break;
-            };
+        while let Some((&due_step, _)) = self.delayed_rows.first_key_value() {
             if due_step > self.logical_step {
                 break;
             }

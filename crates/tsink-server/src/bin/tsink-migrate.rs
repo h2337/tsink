@@ -1099,7 +1099,7 @@ fn fetch_source_raw_checks(
                 ));
             }
             let mut out = BTreeMap::new();
-            for (selector, result) in plan.selectors.iter().zip(response.results.into_iter()) {
+            for (selector, result) in plan.selectors.iter().zip(response.results) {
                 out.insert(selector.clone(), canonicalize_query_result(result));
             }
             Ok(out)
@@ -1163,7 +1163,7 @@ fn fetch_target_raw_checks(
         ));
     }
     let mut out = BTreeMap::new();
-    for (selector, result) in selectors.iter().zip(response.results.into_iter()) {
+    for (selector, result) in selectors.iter().zip(response.results) {
         out.insert(selector.clone(), canonicalize_query_result(result));
     }
     Ok(out)
@@ -2459,7 +2459,7 @@ fn fetch_victoriametrics_export(
         let samples = row
             .values
             .into_iter()
-            .zip(row.timestamps.into_iter())
+            .zip(row.timestamps)
             .map(|(value, timestamp)| {
                 Ok(CanonicalSample {
                     timestamp,

@@ -1599,7 +1599,7 @@ impl TenantScopedStorage {
         merged
             .into_iter()
             .map(|(labels, mut points)| {
-                points.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+                points.sort_by_key(|point| point.timestamp);
                 (labels, points)
             })
             .collect()

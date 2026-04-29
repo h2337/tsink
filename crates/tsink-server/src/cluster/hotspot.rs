@@ -494,7 +494,7 @@ fn hotspot_tracker_snapshot_from_tracker(tracker: &HotspotTracker) -> HotspotTra
             repair_rows_inserted_total: counters.repair_rows_inserted_total,
         })
         .collect::<Vec<_>>();
-    shards.sort_by(|left, right| left.shard.cmp(&right.shard));
+    shards.sort_by_key(|counters| counters.shard);
 
     let mut tenants = tracker
         .tenants

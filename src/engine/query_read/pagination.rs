@@ -80,14 +80,7 @@ impl<'a> SortedSeriesPageCollector<'a> {
                     *pending = point;
                     false
                 }
-                Some(_) => {
-                    if self.flush_pending() {
-                        true
-                    } else {
-                        self.pending = Some(point);
-                        false
-                    }
-                }
+                Some(_) => self.push_after_pending(point),
                 None => {
                     self.pending = Some(point);
                     false
@@ -99,14 +92,7 @@ impl<'a> SortedSeriesPageCollector<'a> {
                 {
                     false
                 }
-                Some(_) => {
-                    if self.flush_pending() {
-                        true
-                    } else {
-                        self.pending = Some(point);
-                        false
-                    }
-                }
+                Some(_) => self.push_after_pending(point),
                 None => {
                     self.pending = Some(point);
                     false
@@ -129,6 +115,15 @@ impl<'a> SortedSeriesPageCollector<'a> {
 
     fn flush_pending(&mut self) -> bool {
         self.pending.take().is_some_and(|point| self.emit(point))
+    }
+
+    fn push_after_pending(&mut self, point: DataPoint) -> bool {
+        if self.flush_pending() {
+            true
+        } else {
+            self.pending = Some(point);
+            false
+        }
     }
 
     fn emit(&mut self, point: DataPoint) -> bool {

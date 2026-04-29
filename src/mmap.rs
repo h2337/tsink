@@ -99,6 +99,7 @@ pub mod windows {
 pub mod unix {
     use super::*;
     use std::fs::OpenOptions;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::OpenOptionsExt;
 
     #[cfg(target_os = "linux")]

@@ -300,7 +300,7 @@ impl Storage for DistributedStorageAdapter {
             .next()
             .map(|item| item.points)
             .unwrap_or_default();
-        points.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        points.sort_by_key(|point| point.timestamp);
 
         self.cache_write(
             self.cache_config.cache_select_points,

@@ -102,8 +102,10 @@ tsink-server \
   --listen 0.0.0.0:9201 \
   --data-path ./var/tsink \
   --cluster-enabled \
+  --cluster-node-id node-1 \
+  --cluster-bind 0.0.0.0:9211 \
   --cluster-replication-factor 3 \
-  --cluster-peers node-2:9202,node-3:9203
+  --cluster-seeds node-2:9212,node-3:9213
 ```
 
 ---

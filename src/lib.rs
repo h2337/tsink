@@ -1,12 +1,21 @@
 //! Public tsink data model and entrypoints.
+//!
+//! The stable API is the set of types and builders re-exported from this crate
+//! root, plus the documented `label`, `promql`, `storage`, `value`, and `wal`
+//! modules. Internal engine modules are hidden from generated documentation and
+//! are not part of the 1.0 compatibility contract.
 
 pub mod r#async;
-pub mod cgroup;
-pub mod concurrency;
+#[allow(dead_code)]
+pub(crate) mod cgroup;
+#[allow(dead_code)]
+pub(crate) mod concurrency;
+#[doc(hidden)]
 pub mod engine;
 pub mod error;
 pub mod label;
-pub mod mmap;
+#[allow(dead_code)]
+pub(crate) mod mmap;
 pub mod promql;
 pub(crate) mod query_aggregation;
 pub(crate) mod query_matcher;

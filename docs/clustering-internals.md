@@ -104,7 +104,7 @@ Each known node is represented as a `ClusterNode`:
 ClusterNode { id: String, endpoint: String }
 ```
 
-The local node is always included. The remaining nodes come from the `--cluster-peers` list (seed nodes).
+The local node is always included. The remaining nodes come from the `--cluster-seeds` list.
 
 **Auto-join:** `AutoJoinRuntime` runs on startup when seed nodes are configured. It periodically calls `control_auto_join` on each seed endpoint until one acknowledges the join, then stops. The probe interval defaults to 3 seconds (`TSINK_CLUSTER_AUTO_JOIN_INTERVAL_SECS`).
 
